@@ -201,6 +201,7 @@ mod linux_impl {
         fd: io_uring::types::Fd,
         ring: IoUring,
         receiver: Receiver<IOUringActorCommand>,
+        in_flight_commands: usize,
     }
 
     impl<const BLOCK_SIZE: usize> IOUringActor<BLOCK_SIZE> {
@@ -210,6 +211,7 @@ mod linux_impl {
         async fn run(self) {
             debug!("Starting actor loop");
             loop {
+                // TODO: grab a buffer of commands
                 match self.receiver.recv_async().await {
                     Ok(IOUringActorCommand::ReadBlock(offset, sender)) => {
                         debug!("ReadBlock: {:?}", offset);
@@ -225,11 +227,14 @@ mod linux_impl {
                         break;
                     }
                 }
+                // TODO: wait for commands to complete, get results, and send back
             }
         }
 
+        // TODO: handle_read
+        // TODO: handle_write
         /// Reads a block from the device into the given buffer.
-        async fn handle_read<T: AlignedBuffer>(
+        async fn handle_read_direct<T: AlignedBuffer>(
             &mut self,
             offset: u64,
             buffer: &mut T,
@@ -246,6 +251,7 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
+            // TODO: just submit and let caller wait
             self.ring.submit_and_wait(1)?;
 
             // Process completion
@@ -259,7 +265,7 @@ mod linux_impl {
         }
 
         /// Writes a block to the device from the given buffer.
-        async fn handle_write<T: AlignedBuffer>(
+        async fn handle_write_direct<T: AlignedBuffer>(
             &mut self,
             offset: u64,
             buffer: &mut T,
@@ -276,6 +282,7 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
+            // TODO: just submit and let caller wait
             self.ring.submit_and_wait(1)?;
 
             // Process completion
@@ -308,6 +315,7 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
+            // TODO: just submit and let caller wait
             self.ring.submit_and_wait(1)?;
 
             // Process completion
