@@ -1,9 +1,15 @@
 // Trait for aligned pages to implement
 #[cfg(target_os = "linux")]
-pub trait AlignedBuffer {
+pub trait AlignedBuffer: Send {
     fn as_ptr(&self) -> *const u8;
     fn as_mut_ptr(&mut self) -> *mut u8;
     fn len(&self) -> usize;
+}
+
+impl std::fmt::Debug for dyn AlignedBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AlignedBuffer")
+    }
 }
 
 /**
@@ -47,14 +53,14 @@ mod linux_impl {
     #[derive(Debug)]
     pub enum IOUringActorCommand {
         ReadBlock(u64, Sender<IOUringActorResponse>),
-        WriteBlock(u64, Sender<IOUringActorResponse>),
+        WriteBlock(u64, Box<dyn AlignedBuffer>, Sender<IOUringActorResponse>),
         TrimBlock(u64, Sender<IOUringActorResponse>),
     }
 
     #[derive(Debug)]
     pub enum IOUringActorResponse {
-        ReadBlock(u64, Vec<u8>),
-        WriteBlock(u64, Vec<u8>),
+        ReadBlock(u64, Box<dyn AlignedBuffer>),
+        WriteBlock(u64),
         TrimBlock(u64),
     }
 
@@ -80,6 +86,62 @@ mod linux_impl {
             tokio::spawn(actor.run());
 
             Ok(Self { sender })
+        }
+
+        pub async fn read_block(
+            &self,
+            offset: u64,
+            buffer: &mut impl AlignedBuffer,
+        ) -> std::io::Result<()> {
+            let (sender, receiver) = flume::unbounded();
+            self.sender
+                .send_async(IOUringActorCommand::ReadBlock(offset, sender))
+                .await
+                .unwrap();
+            let response = receiver.recv_async().await;
+            match response {
+                Ok(IOUringActorResponse::ReadBlock(offset, buffer)) => Ok(()),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Invalid response",
+                )),
+            }
+        }
+
+        pub async fn write_block(
+            &self,
+            offset: u64,
+            buffer: &mut impl AlignedBuffer,
+        ) -> std::io::Result<()> {
+            let (sender, receiver) = flume::unbounded();
+            self.sender
+                .send_async(IOUringActorCommand::WriteBlock(offset, sender))
+                .await
+                .unwrap();
+            let response = receiver.recv_async().await;
+            match response {
+                Ok(IOUringActorResponse::WriteBlock(offset, buffer)) => Ok(()),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Invalid response",
+                )),
+            }
+        }
+
+        pub async fn trim_block(&self, offset: u64) -> std::io::Result<()> {
+            let (sender, receiver) = flume::unbounded();
+            self.sender
+                .send_async(IOUringActorCommand::TrimBlock(offset, sender))
+                .await
+                .unwrap();
+            let response = receiver.recv_async().await;
+            match response {
+                Ok(IOUringActorResponse::TrimBlock(offset)) => Ok(()),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Invalid response",
+                )),
+            }
         }
     }
 
@@ -227,14 +289,16 @@ mod tests {
     #[tokio::test]
     async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
         // Create a shared io_uring instance
-        let ring = Arc::new(Mutex::new(IoUring::new(128)?));
+        let ring = IoUring::new(128)?;
 
         // Create a temporary file path
         let temp_file = tempfile::NamedTempFile::new()?;
         let temp_path = temp_file.path().to_str().unwrap();
 
+        let file = std::fs::File::open(temp_path)?;
+
         // Create a new device instance
-        let mut device = IOUringActor::<BLOCK_SIZE>::new(temp_path, ring)?;
+        let mut api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];
@@ -243,11 +307,11 @@ mod tests {
         let write_page = Page4K(write_data);
 
         // Write test
-        device.write_block(0, &write_page).await?;
+        api.write_block(0, &write_page).await?;
 
         // Read test
         let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
-        device.read_block(0, &mut read_buffer).await?;
+        api.read_block(0, &mut read_buffer).await?;
 
         // Verify the contents
         assert_eq!(&read_buffer.0[..hello.len()], hello);
@@ -259,11 +323,11 @@ mod tests {
         );
 
         // Try trimming the block
-        device.trim_block(0).await?;
+        api.trim_block(0).await?;
 
         // Read the block again
         let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
-        device.read_block(0, &mut read_buffer).await?;
+        api.read_block(0, &mut read_buffer).await?;
 
         // Verify the contents are zeroed
         assert_eq!(&read_buffer.0, &[0u8; BLOCK_SIZE]);
@@ -287,7 +351,10 @@ mod tests {
         let temp_path = temp_file.path().to_str().unwrap();
 
         // Create a new device instance
-        let mut device = IOUringActor::<BLOCK_SIZE>::new(temp_path, ring)?;
+        let file = std::fs::File::open(temp_path)?;
+
+        // Create a new device instance
+        let mut api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];
@@ -296,11 +363,11 @@ mod tests {
         let write_page = Page4K(write_data);
 
         // Write test
-        device.write_block(0, &write_page).await?;
+        api.write_block(0, &write_page).await?;
 
         // Read test
         let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
-        device.read_block(0, &mut read_buffer).await?;
+        api.read_block(0, &mut read_buffer).await?;
 
         // Verify the contents
         assert_eq!(&read_buffer.0[..test_data.len()], test_data);
