@@ -37,59 +37,109 @@ macro_rules! create_aligned_page {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
+    use std::os::fd::AsRawFd;
+
     use super::AlignedBuffer;
+    use flume::{Receiver, Sender};
     use io_uring::{opcode, IoUring};
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use tracing::{debug};
 
-    // Convenience 4k (4096)
-    create_aligned_page!(Page4K, 4096);
-
-    pub struct IOUringDevice<const BLOCK_SIZE: usize> {
-        fd: Option<std::fs::File>,
-        ring: Arc<Mutex<IoUring>>,
+    #[derive(Debug)]
+    pub enum IOUringActorCommand {
+        ReadBlock(u64, Sender<IOUringActorResponse>),
+        WriteBlock(u64, Sender<IOUringActorResponse>),
+        TrimBlock(u64, Sender<IOUringActorResponse>),
     }
 
-    impl<const BLOCK_SIZE: usize> IOUringDevice<BLOCK_SIZE> {
-        pub fn new(device_path: &str, ring: Arc<Mutex<IoUring>>) -> std::io::Result<Self> {
-            let fd = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(device_path)?;
+    #[derive(Debug)]
+    pub enum IOUringActorResponse {
+        ReadBlock(u64, Vec<u8>),
+        WriteBlock(u64, Vec<u8>),
+        TrimBlock(u64),
+    }
 
-            Ok(Self { fd: Some(fd), ring })
+    pub struct IOUringAPI<const BLOCK_SIZE: usize> {
+        sender: Sender<IOUringActorCommand>,
+    }
+
+    impl<const BLOCK_SIZE: usize> IOUringAPI<BLOCK_SIZE> {
+      pub async fn new(
+        fd: std::fs::File,
+        ring: IoUring,
+        channel_size: usize,
+    ) -> std::io::Result<Self> {
+        let (sender, receiver) = match channel_size {
+            0 => flume::unbounded(),
+            _ => flume::bounded(channel_size),
+        };
+
+        let fd = io_uring::types::Fd(fd.as_raw_fd());
+
+        let actor = IOUringActor::<BLOCK_SIZE> {
+            fd,
+            ring,
+            receiver,
+        };
+
+        tokio::spawn(actor.run());
+
+        Ok(Self { sender })
+    }
+    }
+
+    pub struct IOUringActor<const BLOCK_SIZE: usize> {
+        fd: io_uring::types::Fd,
+        ring: IoUring,
+        receiver: Receiver<IOUringActorCommand>,
+    }
+
+    impl<const BLOCK_SIZE: usize> IOUringActor<BLOCK_SIZE> {
+
+        // TODO: Read
+        // TODO: Write
+        // TODO: Delete (calls trim)
+        async fn run(self) {
+            debug!("Starting actor loop");
+            loop {
+                match self.receiver.recv_async().await {
+                    Ok(IOUringActorCommand::ReadBlock(offset, sender)) => {
+                        debug!("ReadBlock: {:?}", offset);
+                    }
+                    Ok(IOUringActorCommand::WriteBlock(offset, sender)) => {
+                        debug!("WriteBlock: {:?}", offset);
+                    }
+                    Ok(IOUringActorCommand::TrimBlock(offset, sender)) => {
+                        debug!("TrimBlock: {:?}", offset);
+                    }
+                    Err(e) => {
+                        // Disconnected
+                        break;
+                    }
+                }
+            }
         }
 
         /// Reads a block from the device into the given buffer.
-        pub async fn read_block<T: AlignedBuffer>(
+        async fn handle_read<T: AlignedBuffer>(
             &mut self,
             offset: u64,
             buffer: &mut T,
         ) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
-
-            let read_e = opcode::Read::new(fd, buffer.as_mut_ptr(), buffer.len() as _)
+            let read_e = opcode::Read::new(self.fd, buffer.as_mut_ptr(), buffer.len() as _)
                 .offset(offset)
                 .build()
                 .user_data(0x42);
 
-            // Lock the ring for this operation
-            let mut ring = self.ring.lock().await;
-
             unsafe {
-                ring.submission()
+                self.ring.submission()
                     .push(&read_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            ring.submit_and_wait(1)?;
+            self.ring.submit_and_wait(1)?;
 
             // Process completion
-            while let Some(cqe) = ring.completion().next() {
+            while let Some(cqe) = self.ring.completion().next() {
                 if cqe.result() < 0 {
                     return Err(std::io::Error::from_raw_os_error(-cqe.result()));
                 }
@@ -99,31 +149,26 @@ mod linux_impl {
         }
 
         /// Writes a block to the device from the given buffer.
-        pub async fn write_block<T: AlignedBuffer>(
+        async fn handle_write<T: AlignedBuffer>(
             &mut self,
             offset: u64,
-            buffer: &T,
+            buffer: &mut T,
         ) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
-
-            let write_e = opcode::Write::new(fd, buffer.as_ptr(), buffer.len() as _)
+            let write_e = opcode::Write::new(self.fd, buffer.as_ptr(), buffer.len() as _)
                 .offset(offset)
                 .build()
                 .user_data(0x43);
 
-            // Lock the ring for this operation
-            let mut ring = self.ring.lock().await;
-
             unsafe {
-                ring.submission()
+                self.ring.submission()
                     .push(&write_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            ring.submit_and_wait(1)?;
+            self.ring.submit_and_wait(1)?;
 
             // Process completion
-            while let Some(cqe) = ring.completion().next() {
+            while let Some(cqe) = self.ring.completion().next() {
                 if cqe.result() < 0 {
                     return Err(std::io::Error::from_raw_os_error(-cqe.result()));
                 }
@@ -135,45 +180,35 @@ mod linux_impl {
         /// Deallocates the block at the given offset using `FALLOC_FL_PUNCH_HOLE`, which creates a hole in the file
         /// and releases the associated storage space. On SSDs this triggers the TRIM command for better performance
         /// and wear leveling.
-        pub async fn trim_block(&mut self, offset: u64) -> std::io::Result<()> {
-            let fd = io_uring::types::Fd(self.fd.as_ref().unwrap().as_raw_fd());
-
+        async fn handle_trim(
+            &mut self,
+            offset: u64,
+        ) -> std::io::Result<()> {
             // FALLOC_FL_PUNCH_HOLE (0x02) | FALLOC_FL_KEEP_SIZE (0x01)
             const PUNCH_HOLE: i32 = 0x02 | 0x01;
 
-            let trim_e = opcode::Fallocate::new(fd, BLOCK_SIZE as u64)
+            let trim_e = opcode::Fallocate::new(self.fd, BLOCK_SIZE as u64)
                 .offset(offset)
                 .mode(PUNCH_HOLE)
                 .build()
                 .user_data(0x44);
 
-            // Lock the ring for this operation
-            let mut ring = self.ring.lock().await;
-
             unsafe {
-                ring.submission()
+                self.ring.submission()
                     .push(&trim_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            ring.submit_and_wait(1)?;
+            self.ring.submit_and_wait(1)?;
 
             // Process completion
-            while let Some(cqe) = ring.completion().next() {
+            while let Some(cqe) = self.ring.completion().next() {
                 if cqe.result() < 0 {
                     return Err(std::io::Error::from_raw_os_error(-cqe.result()));
                 }
             }
 
             Ok(())
-        }
-    }
-
-    impl<const BLOCK_SIZE: usize> Drop for IOUringDevice<BLOCK_SIZE> {
-        fn drop(&mut self) {
-            if let Some(fd) = self.fd.take() {
-                drop(fd);
-            }
         }
     }
 }
@@ -184,13 +219,15 @@ pub use linux_impl::*;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use io_uring::IoUring;
-    use linux_impl::{IOUringDevice, Page4K};
+    use linux_impl::{IOUringActor, IOUringAPI};
     use tokio::sync::Mutex;
 
     use super::*;
     use std::sync::Arc;
 
     const BLOCK_SIZE: usize = 4096;
+
+    create_aligned_page!(Page4K, 4096);
 
     #[tokio::test]
     async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
@@ -202,7 +239,7 @@ mod tests {
         let temp_path = temp_file.path().to_str().unwrap();
 
         // Create a new device instance
-        let mut device = IOUringDevice::<BLOCK_SIZE>::new(temp_path, ring)?;
+        let mut device = IOUringActor::<BLOCK_SIZE>::new(temp_path, ring)?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];
@@ -255,7 +292,7 @@ mod tests {
         let temp_path = temp_file.path().to_str().unwrap();
 
         // Create a new device instance
-        let mut device = IOUringDevice::<BLOCK_SIZE>::new(temp_path, ring)?;
+        let mut device = IOUringActor::<BLOCK_SIZE>::new(temp_path, ring)?;
 
         // Test data
         let mut write_data = [0u8; BLOCK_SIZE];
