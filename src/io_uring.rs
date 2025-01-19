@@ -48,7 +48,7 @@ mod linux_impl {
     use super::AlignedBuffer;
     use flume::{Receiver, Sender};
     use io_uring::{opcode, IoUring};
-    use tracing::debug;
+    use tracing::{debug, warn};
 
     #[derive(Debug)]
     pub enum IOUringActorCommand {
@@ -278,6 +278,7 @@ mod linux_impl {
                             Ok(response)
                         }
                     } else {
+                        println!("No completion queue entry found");
                         Err(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             "Invalid response",
@@ -306,14 +307,7 @@ mod linux_impl {
             }
 
             // TODO: just submit and let caller wait
-            self.ring.submit_and_wait(1)?;
-
-            // Process completion
-            while let Some(cqe) = self.ring.completion().next() {
-                if cqe.result() < 0 {
-                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-                }
-            }
+            self.ring.submit()?;
 
             Ok(buffer)
         }
