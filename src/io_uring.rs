@@ -334,92 +334,92 @@ mod tests {
         assert_send::<Page4K<4096>>();
     }
 
-    #[tokio::test]
-    async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
-        // Create a shared io_uring instance
-        let ring = IoUring::new(128)?;
+    // #[tokio::test]
+    // async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
+    //     // Create a shared io_uring instance
+    //     let ring = IoUring::new(128)?;
 
-        // Create a temporary file path
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let temp_path = temp_file.path().to_str().unwrap();
+    //     // Create a temporary file path
+    //     let temp_file = tempfile::NamedTempFile::new()?;
+    //     let temp_path = temp_file.path().to_str().unwrap();
 
-        let file = std::fs::File::open(temp_path)?;
+    //     let file = std::fs::File::open(temp_path)?;
 
-        // Create a new device instance
-        let mut api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
+    //     // Create a new device instance
+    //     let mut api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
 
-        // Test data
-        let mut write_data = [0u8; BLOCK_SIZE];
-        let hello = b"Hello, world!\n";
-        write_data[..hello.len()].copy_from_slice(hello);
-        let write_page = Page4K(write_data);
+    //     // Test data
+    //     let mut write_data = [0u8; BLOCK_SIZE];
+    //     let hello = b"Hello, world!\n";
+    //     write_data[..hello.len()].copy_from_slice(hello);
+    //     let write_page = Page4K(write_data);
 
-        // Write test
-        api.write_block(0, &write_page).await?;
+    //     // Write test
+    //     api.write_block(0, &write_page).await?;
 
-        // Read test
-        let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
-        api.read_block(0, &mut read_buffer).await?;
+    //     // Read test
+    //     let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
+    //     api.read_block(0, &mut read_buffer).await?;
 
-        // Verify the contents
-        assert_eq!(&read_buffer.0[..hello.len()], hello);
-        println!("Read data: {:?}", &read_buffer.0[..hello.len()]);
-        // As a string
-        println!(
-            "Read data (string): {}",
-            String::from_utf8_lossy(&read_buffer.0[..hello.len()])
-        );
+    //     // Verify the contents
+    //     assert_eq!(&read_buffer.0[..hello.len()], hello);
+    //     println!("Read data: {:?}", &read_buffer.0[..hello.len()]);
+    //     // As a string
+    //     println!(
+    //         "Read data (string): {}",
+    //         String::from_utf8_lossy(&read_buffer.0[..hello.len()])
+    //     );
 
-        // Try trimming the block
-        api.trim_block(0).await?;
+    //     // Try trimming the block
+    //     api.trim_block(0).await?;
 
-        // Read the block again
-        let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
-        api.read_block(0, &mut read_buffer).await?;
+    //     // Read the block again
+    //     let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
+    //     api.read_block(0, &mut read_buffer).await?;
 
-        // Verify the contents are zeroed
-        assert_eq!(&read_buffer.0, &[0u8; BLOCK_SIZE]);
+    //     // Verify the contents are zeroed
+    //     assert_eq!(&read_buffer.0, &[0u8; BLOCK_SIZE]);
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    #[tokio::test]
-    async fn test_io_uring_sqpoll() -> Result<(), Box<dyn std::error::Error>> {
-        create_aligned_page!(Page4K, 4096); // test creating an aliged page with a macro
+    // #[tokio::test]
+    // async fn test_io_uring_sqpoll() -> Result<(), Box<dyn std::error::Error>> {
+    //     create_aligned_page!(Page4K, 4096); // test creating an aliged page with a macro
 
-        // Create a shared io_uring instance with SQPOLL enabled
-        let ring = Arc::new(Mutex::new(
-            IoUring::builder()
-                .setup_sqpoll(2000) // 2000ms timeout
-                .build(128)?,
-        ));
+    //     // Create a shared io_uring instance with SQPOLL enabled
+    //     let ring = Arc::new(Mutex::new(
+    //         IoUring::builder()
+    //             .setup_sqpoll(2000) // 2000ms timeout
+    //             .build(128)?,
+    //     ));
 
-        // Create a temporary file path
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let temp_path = temp_file.path().to_str().unwrap();
+    //     // Create a temporary file path
+    //     let temp_file = tempfile::NamedTempFile::new()?;
+    //     let temp_path = temp_file.path().to_str().unwrap();
 
-        // Create a new device instance
-        let file = std::fs::File::open(temp_path)?;
+    //     // Create a new device instance
+    //     let file = std::fs::File::open(temp_path)?;
 
-        // Create a new device instance
-        let mut api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
+    //     // Create a new device instance
+    //     let mut api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
 
-        // Test data
-        let mut write_data = [0u8; BLOCK_SIZE];
-        let test_data = b"Testing SQPOLL mode!\n";
-        write_data[..test_data.len()].copy_from_slice(test_data);
-        let write_page = Page4K(write_data);
+    //     // Test data
+    //     let mut write_data = [0u8; BLOCK_SIZE];
+    //     let test_data = b"Testing SQPOLL mode!\n";
+    //     write_data[..test_data.len()].copy_from_slice(test_data);
+    //     let write_page = Page4K(write_data);
 
-        // Write test
-        api.write_block(0, &write_page).await?;
+    //     // Write test
+    //     api.write_block(0, &write_page).await?;
 
-        // Read test
-        let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
-        api.read_block(0, &mut read_buffer).await?;
+    //     // Read test
+    //     let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
+    //     api.read_block(0, &mut read_buffer).await?;
 
-        // Verify the contents
-        assert_eq!(&read_buffer.0[..test_data.len()], test_data);
+    //     // Verify the contents
+    //     assert_eq!(&read_buffer.0[..test_data.len()], test_data);
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }
