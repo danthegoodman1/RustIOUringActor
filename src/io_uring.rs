@@ -52,15 +52,29 @@ mod linux_impl {
 
     #[derive(Debug)]
     pub enum IOUringActorCommand {
+        // Non-direct
         ReadBlock(u64, Sender<IOUringActorResponse>),
-        WriteBlock(u64, Box<dyn AlignedBuffer>, Sender<IOUringActorResponse>),
+        WriteBlock(u64, Vec<u8>, Sender<IOUringActorResponse>),
+
+        // Direct
+        ReadBlockDirect(u64, Sender<IOUringActorResponse>),
+        WriteBlockDirect(u64, Box<dyn AlignedBuffer>, Sender<IOUringActorResponse>),
+
+        // Other commands
         TrimBlock(u64, Sender<IOUringActorResponse>),
     }
 
     #[derive(Debug)]
     pub enum IOUringActorResponse {
-        ReadBlock(u64, Box<dyn AlignedBuffer>),
+        // Direct
+        ReadBlockDirect(u64, Box<dyn AlignedBuffer>),
+        WriteBlockDirect(u64),
+
+        // Non-direct
+        ReadBlock(u64, Vec<u8>),
         WriteBlock(u64),
+
+        // Other responses
         TrimBlock(u64),
     }
 
@@ -88,6 +102,27 @@ mod linux_impl {
             Ok(Self { sender })
         }
 
+
+        /// Read uses non-direct IO to read a block from the device.
+        pub async fn read(
+            &self,
+            offset: u64,
+        ) -> std::io::Result<Vec<u8>> {
+            let (sender, receiver) = flume::unbounded();
+            self.sender
+                .send_async(IOUringActorCommand::ReadBlock(offset, sender))
+                .await
+                .unwrap();
+            let response = receiver.recv_async().await;
+            match response {
+                Ok(IOUringActorResponse::ReadBlock(offset, buffer)) => Ok(buffer),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Invalid response",
+                )),
+            }
+        }
+
         pub async fn read_block(
             &self,
             offset: u64,
@@ -108,6 +143,23 @@ mod linux_impl {
             }
         }
 
+        /// Write uses non-direct IO to write a buffer to the device.
+        pub async fn write(
+            &self,
+            offset: u64,
+            buffer: Vec<u8>,
+        ) -> std::io::Result<()> {
+            let (sender, receiver) = flume::unbounded();
+            self.sender
+                .send_async(IOUringActorCommand::WriteBlock(offset, buffer, sender))
+                .await
+                .unwrap();
+            let response = receiver.recv_async().await;
+            match response {
+                Ok(IOUringActorResponse::WriteBlock(offset)) => Ok(()),
+        }
+
+        /// write_block uses direct IO to write a block to the device.
         pub async fn write_block(
             &self,
             offset: u64,
@@ -115,7 +167,7 @@ mod linux_impl {
         ) -> std::io::Result<()> {
             let (sender, receiver) = flume::unbounded();
             self.sender
-                .send_async(IOUringActorCommand::WriteBlock(offset, sender))
+                .send_async(IOUringActorCommand::WriteBlockDirect(offset, buffer, sender))
                 .await
                 .unwrap();
             let response = receiver.recv_async().await;
