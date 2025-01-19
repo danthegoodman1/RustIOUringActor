@@ -53,29 +53,48 @@ mod linux_impl {
     #[derive(Debug)]
     pub enum IOUringActorCommand {
         // Non-direct
-        ReadBlock(u64, Sender<IOUringActorResponse>),
-        WriteBlock(u64, Vec<u8>, Sender<IOUringActorResponse>),
+        Read {
+            offset: u64,
+            size: usize,
+            sender: Sender<std::io::Result<IOUringActorResponse>>,
+        },
+        Write {
+            offset: u64,
+            buffer: Vec<u8>,
+            sender: Sender<std::io::Result<IOUringActorResponse>>,
+        },
 
         // Direct
-        ReadBlockDirect(u64, Sender<IOUringActorResponse>),
-        WriteBlockDirect(u64, Box<dyn AlignedBuffer>, Sender<IOUringActorResponse>),
+        ReadBlockDirect {
+            offset: u64,
+            buffer: Box<dyn AlignedBuffer>,
+            sender: Sender<std::io::Result<IOUringActorResponse>>,
+        },
+        WriteBlockDirect {
+            offset: u64,
+            buffer: Box<dyn AlignedBuffer>,
+            sender: Sender<std::io::Result<IOUringActorResponse>>,
+        },
 
         // Other commands
-        TrimBlock(u64, Sender<IOUringActorResponse>),
+        TrimBlock {
+            offset: u64,
+            sender: Sender<std::io::Result<IOUringActorResponse>>,
+        },
     }
 
     #[derive(Debug)]
     pub enum IOUringActorResponse {
-        // Direct
-        ReadBlockDirect(u64, Box<dyn AlignedBuffer>),
-        WriteBlockDirect(u64),
-
         // Non-direct
-        ReadBlock(u64, Vec<u8>),
-        WriteBlock(u64),
+        Read(Vec<u8>),
+        Write,
+
+        // Direct
+        ReadBlockDirect(Box<dyn AlignedBuffer>),
+        WriteBlockDirect,
 
         // Other responses
-        TrimBlock(u64),
+        TrimBlock,
     }
 
     pub struct IOUringAPI<const BLOCK_SIZE: usize> {
@@ -93,29 +112,35 @@ mod linux_impl {
                 _ => flume::bounded(channel_size),
             };
 
-            let fd = io_uring::types::Fd(fd.as_raw_fd());
+            let uring_fd = io_uring::types::Fd(fd.as_raw_fd());
 
-            let actor = IOUringActor::<BLOCK_SIZE> { fd, ring, receiver, in_flight_commands: 0 };
+            let actor = IOUringActor::<BLOCK_SIZE> {
+                _fd: fd,
+                fd: uring_fd,
+                ring,
+                receiver,
+            };
 
             tokio::spawn(actor.run());
 
             Ok(Self { sender })
         }
 
-
         /// Read uses non-direct IO to read a block from the device.
-        pub async fn read(
-            &self,
-            offset: u64,
-        ) -> std::io::Result<Vec<u8>> {
+        pub async fn read(&self, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
             let (sender, receiver) = flume::unbounded();
             self.sender
-                .send_async(IOUringActorCommand::ReadBlock(offset, sender))
+                .send_async(IOUringActorCommand::Read {
+                    offset,
+                    size,
+                    sender,
+                })
                 .await
                 .unwrap();
-            let response = receiver.recv_async().await;
+            let response = receiver.recv_async().await.unwrap();
+            println!("Read response: {:?}", response);
             match response {
-                Ok(IOUringActorResponse::ReadBlock(offset, buffer)) => Ok(buffer),
+                Ok(IOUringActorResponse::Read(result)) => Ok(result),
                 _ => Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "Invalid response",
@@ -128,34 +153,29 @@ mod linux_impl {
             offset: u64,
             buffer: &mut impl AlignedBuffer,
         ) -> std::io::Result<()> {
+            todo!()
+        }
+
+        /// Write uses non-direct IO to write a buffer to the device.
+        pub async fn write(&self, offset: u64, buffer: Vec<u8>) -> std::io::Result<()> {
             let (sender, receiver) = flume::unbounded();
             self.sender
-                .send_async(IOUringActorCommand::ReadBlock(offset, sender))
+                .send_async(IOUringActorCommand::Write {
+                    offset,
+                    buffer,
+                    sender,
+                })
                 .await
                 .unwrap();
-            let response = receiver.recv_async().await;
+            let response = receiver.recv_async().await.unwrap();
+            println!("Write response: {:?}", response);
             match response {
-                Ok(IOUringActorResponse::ReadBlock(offset, buffer)) => Ok(()),
+                Ok(IOUringActorResponse::Write) => Ok(()),
                 _ => Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "Invalid response",
                 )),
             }
-        }
-
-        /// Write uses non-direct IO to write a buffer to the device.
-        pub async fn write(
-            &self,
-            offset: u64,
-            buffer: Vec<u8>,
-        ) -> std::io::Result<()> {
-            let (sender, receiver) = flume::unbounded();
-            self.sender
-                .send_async(IOUringActorCommand::WriteBlock(offset, buffer, sender))
-                .await
-                .unwrap();
-            let response = receiver.recv_async().await;
-            todo!()
         }
 
         /// write_block uses direct IO to write a block to the device.
@@ -173,47 +193,131 @@ mod linux_impl {
     }
 
     pub struct IOUringActor<const BLOCK_SIZE: usize> {
+        _fd: std::fs::File, // Keeps the file descriptor alive
         fd: io_uring::types::Fd,
         ring: IoUring,
         receiver: Receiver<IOUringActorCommand>,
-        in_flight_commands: usize,
     }
 
     impl<const BLOCK_SIZE: usize> IOUringActor<BLOCK_SIZE> {
         // TODO: Read
         // TODO: Write
         // TODO: Delete (calls trim)
-        async fn run(self) {
+        async fn run(mut self) {
             debug!("Starting actor loop");
             loop {
-                // TODO: grab a buffer of commands
+                let mut responders = Vec::new();
                 match self.receiver.recv_async().await {
-                    Ok(IOUringActorCommand::ReadBlock(offset, sender)) => {
-                        debug!("ReadBlock: {:?}", offset);
+                    Ok(IOUringActorCommand::Read {
+                        offset,
+                        size,
+                        sender,
+                    }) => {
+                        debug!("Read: {:?}", offset);
+                        match self.handle_read(offset, size).await {
+                            Ok(result) => {
+                                responders.push((sender, IOUringActorResponse::Read(result)))
+                            }
+                            Err(e) => {
+                                debug!("handle_read error: {:?}", e);
+                                // We don't care if this fails because the channel is closed
+                                let _ = sender.send_async(Err(e)).await;
+                            }
+                        }
                     }
-                    Ok(IOUringActorCommand::WriteBlock(offset, buffer, sender)) => {
+
+                    Ok(IOUringActorCommand::Write {
+                        offset,
+                        buffer,
+                        sender,
+                    }) => {
                         debug!("WriteBlock: {:?}", offset);
+                        match self.handle_write(offset, buffer).await {
+                            Ok(()) => responders.push((sender, IOUringActorResponse::Write)),
+                            Err(e) => {
+                                debug!("handle_write error: {:?}", e);
+                                // We don't care if this fails because the channel is closed
+                                let _ = sender.send_async(Err(e)).await;
+                            }
+                        }
                     }
-                    Ok(IOUringActorCommand::TrimBlock(offset, sender)) => {
+
+                    Ok(IOUringActorCommand::TrimBlock { offset, sender }) => {
                         debug!("TrimBlock: {:?}", offset);
                     }
-                    Ok(IOUringActorCommand::ReadBlockDirect(offset, sender)) => {
+
+                    Ok(IOUringActorCommand::ReadBlockDirect {
+                        offset,
+                        buffer,
+                        sender,
+                    }) => {
                         debug!("ReadBlockDirect: {:?}", offset);
                     }
-                    Ok(IOUringActorCommand::WriteBlockDirect(offset, buffer, sender)) => {
+
+                    Ok(IOUringActorCommand::WriteBlockDirect {
+                        offset,
+                        buffer,
+                        sender,
+                    }) => {
                         debug!("WriteBlockDirect: {:?}", offset);
                     }
+
                     Err(e) => {
                         // Disconnected
                         break;
                     }
                 }
-                // TODO: wait for commands to complete, get results, and send back
+
+                // Process completion - Modified to not hold completion queue across await
+                for (sender, response) in responders {
+                    let result = if let Some(cqe) = self.ring.completion().next() {
+                        if cqe.result() < 0 {
+                            debug!("Completion error: {:?}", cqe.result());
+                            Err(std::io::Error::from_raw_os_error(-cqe.result()))
+                        } else {
+                            Ok(response)
+                        }
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Invalid response",
+                        ))
+                    };
+
+                    // Now we can await after we're done with the completion queue since it's not Send,
+                    // and we don't care about the result of the send
+                    let _ = sender.send_async(result).await;
+                }
             }
         }
 
-        // TODO: handle_read
-        // TODO: handle_write
+        async fn handle_read(&mut self, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
+            let mut buffer = vec![0u8; size];
+            let read_e = opcode::Read::new(self.fd, buffer.as_mut_ptr(), buffer.len() as _)
+                .offset(offset)
+                .build()
+                .user_data(0x42);
+
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&read_e)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+
+            // TODO: just submit and let caller wait
+            self.ring.submit_and_wait(1)?;
+
+            // Process completion
+            while let Some(cqe) = self.ring.completion().next() {
+                if cqe.result() < 0 {
+                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+                }
+            }
+
+            Ok(buffer)
+        }
+
         /// Reads a block from the device into the given buffer.
         async fn handle_read_direct<T: AlignedBuffer>(
             &mut self,
@@ -241,6 +345,25 @@ mod linux_impl {
                     return Err(std::io::Error::from_raw_os_error(-cqe.result()));
                 }
             }
+
+            Ok(())
+        }
+
+        /// Writes data, returning after submission
+        async fn handle_write(&mut self, offset: u64, buffer: Vec<u8>) -> std::io::Result<()> {
+            let write_e = opcode::Write::new(self.fd, buffer.as_ptr(), buffer.len() as _)
+                .offset(offset)
+                .build()
+                .user_data(0x43);
+
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&write_e)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+
+            self.ring.submit()?;
 
             Ok(())
         }
@@ -317,13 +440,34 @@ pub use linux_impl::*;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use io_uring::IoUring;
-    use linux_impl::{IOUringAPI, IOUringActor};
-    use tokio::sync::Mutex;
+    use linux_impl::IOUringAPI;
+    use tracing::Level;
+    use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, Layer};
 
     use super::*;
-    use std::sync::Arc;
+    use std::{os::unix::fs::OpenOptionsExt, sync::Once};
+
+    static LOGGER_ONCE: Once = Once::new();
 
     const BLOCK_SIZE: usize = 4096;
+
+    fn create_logger() {
+        LOGGER_ONCE.call_once(|| {
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_span_events(FmtSpan::CLOSE)
+                    .with_target(false)
+                    .with_filter(
+                        tracing_subscriber::filter::Targets::new().with_default(Level::DEBUG),
+                    ),
+            );
+
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+    }
 
     // Test to ensure AlignedBuffer implements Send trait
     #[tokio::test]
@@ -333,54 +477,70 @@ mod tests {
         assert_send::<Page4K<4096>>();
     }
 
-    // #[tokio::test]
-    // async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
-    //     // Create a shared io_uring instance
-    //     let ring = IoUring::new(128)?;
+    #[tokio::test]
+    async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
+        create_logger();
+        // Create a shared io_uring instance
+        let ring = IoUring::new(128)?;
 
-    //     // Create a temporary file path
-    //     let temp_file = tempfile::NamedTempFile::new()?;
-    //     let temp_path = temp_file.path().to_str().unwrap();
+        // Create a temporary file path
+        // let temp_file = tempfile::NamedTempFile::new()?;
+        let temp_path = "blah.test";
+        println!("temp_path: {:?}", temp_path);
 
-    //     let file = std::fs::File::open(temp_path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // .custom_flags(libc::O_DIRECT | libc::O_DSYNC)
+            .open(temp_path)?;
 
-    //     // Create a new device instance
-    //     let mut api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
+        println!("fd: {:?}", file);
 
-    //     // Test data
-    //     let mut write_data = [0u8; BLOCK_SIZE];
-    //     let hello = b"Hello, world!\n";
-    //     write_data[..hello.len()].copy_from_slice(hello);
-    //     let write_page = Page4K(write_data);
+        // let test_data = b"Hello, basic file test!";
+        // file.write_all(test_data)?;
+        // file.flush()?;
 
-    //     // Write test
-    //     api.write_block(0, &write_page).await?;
+        // // Read back the data
+        // let mut file = std::fs::File::open(temp_path)?;
+        // let mut contents = Vec::new();
+        // file.read_to_end(&mut contents)?;
 
-    //     // Read test
-    //     let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
-    //     api.read_block(0, &mut read_buffer).await?;
+        // // Verify contents
+        // assert_eq!(&contents, test_data);
 
-    //     // Verify the contents
-    //     assert_eq!(&read_buffer.0[..hello.len()], hello);
-    //     println!("Read data: {:?}", &read_buffer.0[..hello.len()]);
-    //     // As a string
-    //     println!(
-    //         "Read data (string): {}",
-    //         String::from_utf8_lossy(&read_buffer.0[..hello.len()])
-    //     );
+        // println!("contents: {:?}", contents);
 
-    //     // Try trimming the block
-    //     api.trim_block(0).await?;
+        // Create a new device instance
+        let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
 
-    //     // Read the block again
-    //     let mut read_buffer = Page4K([0u8; BLOCK_SIZE]);
-    //     api.read_block(0, &mut read_buffer).await?;
+        // Start by reading existing content
+        // Read test
+        let result = api.read(0, 3).await.unwrap();
+        println!("read result: {:?}", result);
 
-    //     // Verify the contents are zeroed
-    //     assert_eq!(&read_buffer.0, &[0u8; BLOCK_SIZE]);
+        // Test data
+        let mut write_data = [0u8; BLOCK_SIZE];
+        let hello = b"Hello, world!\n";
+        write_data[..hello.len()].copy_from_slice(hello);
 
-    //     Ok(())
-    // }
+        // Write test
+        api.write(0, write_data.to_vec()).await.unwrap();
+
+        // Read test
+        let result = api.read(0, 3).await.unwrap();
+
+        // Verify the contents
+        assert_eq!(&result[..hello.len()], hello);
+        println!("Read data: {:?}", &result[..hello.len()]);
+        // As a string
+        println!(
+            "Read data (string): {}",
+            String::from_utf8_lossy(&result[..hello.len()])
+        );
+
+        Ok(())
+    }
 
     // #[tokio::test]
     // async fn test_io_uring_sqpoll() -> Result<(), Box<dyn std::error::Error>> {
