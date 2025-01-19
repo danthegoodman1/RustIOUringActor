@@ -42,7 +42,7 @@ mod linux_impl {
     use super::AlignedBuffer;
     use flume::{Receiver, Sender};
     use io_uring::{opcode, IoUring};
-    use tracing::{debug};
+    use tracing::debug;
 
     #[derive(Debug)]
     pub enum IOUringActorCommand {
@@ -63,28 +63,24 @@ mod linux_impl {
     }
 
     impl<const BLOCK_SIZE: usize> IOUringAPI<BLOCK_SIZE> {
-      pub async fn new(
-        fd: std::fs::File,
-        ring: IoUring,
-        channel_size: usize,
-    ) -> std::io::Result<Self> {
-        let (sender, receiver) = match channel_size {
-            0 => flume::unbounded(),
-            _ => flume::bounded(channel_size),
-        };
+        pub async fn new(
+            fd: std::fs::File,
+            ring: IoUring,
+            channel_size: usize,
+        ) -> std::io::Result<Self> {
+            let (sender, receiver) = match channel_size {
+                0 => flume::unbounded(),
+                _ => flume::bounded(channel_size),
+            };
 
-        let fd = io_uring::types::Fd(fd.as_raw_fd());
+            let fd = io_uring::types::Fd(fd.as_raw_fd());
 
-        let actor = IOUringActor::<BLOCK_SIZE> {
-            fd,
-            ring,
-            receiver,
-        };
+            let actor = IOUringActor::<BLOCK_SIZE> { fd, ring, receiver };
 
-        tokio::spawn(actor.run());
+            tokio::spawn(actor.run());
 
-        Ok(Self { sender })
-    }
+            Ok(Self { sender })
+        }
     }
 
     pub struct IOUringActor<const BLOCK_SIZE: usize> {
@@ -94,7 +90,6 @@ mod linux_impl {
     }
 
     impl<const BLOCK_SIZE: usize> IOUringActor<BLOCK_SIZE> {
-
         // TODO: Read
         // TODO: Write
         // TODO: Delete (calls trim)
@@ -131,7 +126,8 @@ mod linux_impl {
                 .user_data(0x42);
 
             unsafe {
-                self.ring.submission()
+                self.ring
+                    .submission()
                     .push(&read_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
@@ -160,7 +156,8 @@ mod linux_impl {
                 .user_data(0x43);
 
             unsafe {
-                self.ring.submission()
+                self.ring
+                    .submission()
                     .push(&write_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
@@ -180,10 +177,7 @@ mod linux_impl {
         /// Deallocates the block at the given offset using `FALLOC_FL_PUNCH_HOLE`, which creates a hole in the file
         /// and releases the associated storage space. On SSDs this triggers the TRIM command for better performance
         /// and wear leveling.
-        async fn handle_trim(
-            &mut self,
-            offset: u64,
-        ) -> std::io::Result<()> {
+        async fn handle_trim(&mut self, offset: u64) -> std::io::Result<()> {
             // FALLOC_FL_PUNCH_HOLE (0x02) | FALLOC_FL_KEEP_SIZE (0x01)
             const PUNCH_HOLE: i32 = 0x02 | 0x01;
 
@@ -194,7 +188,8 @@ mod linux_impl {
                 .user_data(0x44);
 
             unsafe {
-                self.ring.submission()
+                self.ring
+                    .submission()
                     .push(&trim_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
@@ -219,7 +214,7 @@ pub use linux_impl::*;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use io_uring::IoUring;
-    use linux_impl::{IOUringActor, IOUringAPI};
+    use linux_impl::{IOUringAPI, IOUringActor};
     use tokio::sync::Mutex;
 
     use super::*;
