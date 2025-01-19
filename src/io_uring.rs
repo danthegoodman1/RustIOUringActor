@@ -325,11 +325,10 @@ mod tests {
 
     const BLOCK_SIZE: usize = 4096;
 
-    create_aligned_page!(Page4K, 4096);
-
-    // Test to ensure page4k implements Send trait
+    // Test to ensure AlignedBuffer implements Send trait
     #[tokio::test]
-    async fn test_page4k_is_send() {
+    async fn test_aligned_buffer_is_send() {
+        create_aligned_page!(Page4K, 4096);
         fn assert_send<T: Send>() {}
         assert_send::<Page4K<4096>>();
     }
