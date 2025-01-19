@@ -95,7 +95,7 @@ mod linux_impl {
 
             let fd = io_uring::types::Fd(fd.as_raw_fd());
 
-            let actor = IOUringActor::<BLOCK_SIZE> { fd, ring, receiver };
+            let actor = IOUringActor::<BLOCK_SIZE> { fd, ring, receiver, in_flight_commands: 0 };
 
             tokio::spawn(actor.run());
 
@@ -155,8 +155,7 @@ mod linux_impl {
                 .await
                 .unwrap();
             let response = receiver.recv_async().await;
-            match response {
-                Ok(IOUringActorResponse::WriteBlock(offset)) => Ok(()),
+            todo!()
         }
 
         /// write_block uses direct IO to write a block to the device.
@@ -165,35 +164,11 @@ mod linux_impl {
             offset: u64,
             buffer: &mut impl AlignedBuffer,
         ) -> std::io::Result<()> {
-            let (sender, receiver) = flume::unbounded();
-            self.sender
-                .send_async(IOUringActorCommand::WriteBlockDirect(offset, buffer, sender))
-                .await
-                .unwrap();
-            let response = receiver.recv_async().await;
-            match response {
-                Ok(IOUringActorResponse::WriteBlock(offset, buffer)) => Ok(()),
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Invalid response",
-                )),
-            }
+            todo!()
         }
 
         pub async fn trim_block(&self, offset: u64) -> std::io::Result<()> {
-            let (sender, receiver) = flume::unbounded();
-            self.sender
-                .send_async(IOUringActorCommand::TrimBlock(offset, sender))
-                .await
-                .unwrap();
-            let response = receiver.recv_async().await;
-            match response {
-                Ok(IOUringActorResponse::TrimBlock(offset)) => Ok(()),
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Invalid response",
-                )),
-            }
+            todo!()
         }
     }
 
@@ -216,11 +191,17 @@ mod linux_impl {
                     Ok(IOUringActorCommand::ReadBlock(offset, sender)) => {
                         debug!("ReadBlock: {:?}", offset);
                     }
-                    Ok(IOUringActorCommand::WriteBlock(offset, sender)) => {
+                    Ok(IOUringActorCommand::WriteBlock(offset, buffer, sender)) => {
                         debug!("WriteBlock: {:?}", offset);
                     }
                     Ok(IOUringActorCommand::TrimBlock(offset, sender)) => {
                         debug!("TrimBlock: {:?}", offset);
+                    }
+                    Ok(IOUringActorCommand::ReadBlockDirect(offset, sender)) => {
+                        debug!("ReadBlockDirect: {:?}", offset);
+                    }
+                    Ok(IOUringActorCommand::WriteBlockDirect(offset, buffer, sender)) => {
+                        debug!("WriteBlockDirect: {:?}", offset);
                     }
                     Err(e) => {
                         // Disconnected
@@ -345,6 +326,13 @@ mod tests {
     const BLOCK_SIZE: usize = 4096;
 
     create_aligned_page!(Page4K, 4096);
+
+    // Test to ensure page4k implements Send trait
+    #[tokio::test]
+    async fn test_page4k_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Page4K<4096>>();
+    }
 
     #[tokio::test]
     async fn test_io_uring_read_write() -> Result<(), Box<dyn std::error::Error>> {
