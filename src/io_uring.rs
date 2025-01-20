@@ -274,6 +274,7 @@ mod linux_impl {
                     }
                 }
 
+                // TODO: instead of submit and wait, submit within the handler and then poll the completion queue with completion.is_empty() and yield_now if there are no completions
                 // Process completion - Modified to not hold completion queue across await
                 for (sender, response) in responders {
                     // First we need to wait for the completion queue to have an entry
