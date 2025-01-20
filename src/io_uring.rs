@@ -49,7 +49,7 @@ mod linux_impl {
     use flume::{Receiver, Sender, TryRecvError};
     use io_uring::{opcode, IoUring};
     use tokio::task::yield_now;
-    use tracing::{debug, error, info};
+    use tracing::{debug, error, info, instrument};
 
     #[derive(Debug)]
     pub enum IOUringActorCommand {
@@ -128,6 +128,7 @@ mod linux_impl {
         }
 
         /// Read uses non-direct IO to read a block from the device.
+        #[instrument(skip_all, level = "debug")]
         pub async fn read(&self, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
             let (sender, receiver) = flume::unbounded();
             self.sender
@@ -158,6 +159,7 @@ mod linux_impl {
         }
 
         /// Write uses non-direct IO to write a buffer to the device.
+        #[instrument(skip_all, level = "debug")]
         pub async fn write(&self, offset: u64, buffer: Vec<u8>) -> std::io::Result<()> {
             let (sender, receiver) = flume::unbounded();
             self.sender
@@ -397,6 +399,7 @@ mod linux_impl {
 
         /// Writes data, returning after submission
         async fn handle_write(&mut self, offset: u64, buffer: &[u8]) -> std::io::Result<()> {
+            // Submit the write
             let write_e = opcode::Write::new(self.fd, buffer.as_ptr(), buffer.len() as _)
                 .offset(offset)
                 .build()
@@ -409,21 +412,15 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            // self.ring.submit()?;
+            // TODO: Add an fsync operation, maybe return "skip" responses and we can have None's that don't get sent?
+            // // Add an fsync operation
+            // let fsync_e = opcode::Fsync::new(self.fd).build().user_data(0x44);
 
             // unsafe {
             //     self.ring
             //         .submission()
-            //         .push(&write_e)
+            //         .push(&fsync_e)
             //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            // }
-
-            // self.ring.submit_and_wait(1)?;
-
-            // while let Some(cqe) = self.ring.completion().next() {
-            //     if cqe.result() < 0 {
-            //         return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-            //     }
             // }
 
             Ok(())
