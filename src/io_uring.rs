@@ -207,6 +207,7 @@ mod linux_impl {
             debug!("Starting actor loop");
             loop {
                 let mut responders = Vec::new();
+                let mut keep_alive_buffers = Vec::new(); // FIXME: This is a hack to keep the buffer alive
                 match self.receiver.recv_async().await {
                     Ok(IOUringActorCommand::Read {
                         offset,
@@ -232,10 +233,11 @@ mod linux_impl {
                         sender,
                     }) => {
                         debug!("WriteBlock: {:?}", offset);
-                        // FIXME: The buffer is getting dropped at the end of this match arm, so the data
-                        // that's written to the file is some random junk memory
-                        match self.handle_write(offset, buffer).await {
-                            Ok(()) => responders.push((sender, IOUringActorResponse::Write)),
+                        match self.handle_write(offset, &buffer).await {
+                            Ok(()) => {
+                                responders.push((sender, IOUringActorResponse::Write));
+                                keep_alive_buffers.push(buffer);
+                            }
                             Err(e) => {
                                 debug!("handle_write error: {:?}", e);
                                 // We don't care if this fails because the channel is closed
@@ -310,7 +312,7 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            self.ring.submit()?;
+            // self.ring.submit()?;
 
             // TODO: just submit and let caller wait
             // self.ring.submit_and_wait(1)?;
@@ -359,7 +361,7 @@ mod linux_impl {
         }
 
         /// Writes data, returning after submission
-        async fn handle_write(&mut self, offset: u64, buffer: Vec<u8>) -> std::io::Result<()> {
+        async fn handle_write(&mut self, offset: u64, buffer: &[u8]) -> std::io::Result<()> {
             let write_e = opcode::Write::new(self.fd, buffer.as_ptr(), buffer.len() as _)
                 .offset(offset)
                 .build()
@@ -372,7 +374,7 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            self.ring.submit()?;
+            // self.ring.submit()?;
 
             // unsafe {
             //     self.ring
