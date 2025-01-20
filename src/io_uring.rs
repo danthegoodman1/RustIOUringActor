@@ -232,6 +232,8 @@ mod linux_impl {
                         sender,
                     }) => {
                         debug!("WriteBlock: {:?}", offset);
+                        // FIXME: The buffer is getting dropped at the end of this match arm, so the data
+                        // that's written to the file is some random junk memory
                         match self.handle_write(offset, buffer).await {
                             Ok(()) => responders.push((sender, IOUringActorResponse::Write)),
                             Err(e) => {
@@ -270,6 +272,8 @@ mod linux_impl {
 
                 // Process completion - Modified to not hold completion queue across await
                 for (sender, response) in responders {
+                    // First we need to wait for the completion queue to have an entry
+                    self.ring.submit_and_wait(1).unwrap();
                     let result = if let Some(cqe) = self.ring.completion().next() {
                         if cqe.result() < 0 {
                             debug!("Completion error: {:?}", cqe.result());
@@ -306,8 +310,19 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            // TODO: just submit and let caller wait
             self.ring.submit()?;
+
+            // TODO: just submit and let caller wait
+            // self.ring.submit_and_wait(1)?;
+
+            // // Process completion
+            // while let Some(cqe) = self.ring.completion().next() {
+            //     if cqe.result() < 0 {
+            //         return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+            //     }
+            // }
+
+            // println!("Read completed {:?}", buffer);
 
             Ok(buffer)
         }
@@ -358,6 +373,21 @@ mod linux_impl {
             }
 
             self.ring.submit()?;
+
+            // unsafe {
+            //     self.ring
+            //         .submission()
+            //         .push(&write_e)
+            //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            // }
+
+            // self.ring.submit_and_wait(1)?;
+
+            // while let Some(cqe) = self.ring.completion().next() {
+            //     if cqe.result() < 0 {
+            //         return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+            //     }
+            // }
 
             Ok(())
         }
@@ -514,24 +544,23 @@ mod tests {
         println!("read result: {:?}", result);
 
         // Test data
-        let mut write_data = [0u8; BLOCK_SIZE];
+        // let mut write_data = [0u8; 1033];
         let hello = b"Hello, world!\n";
-        write_data[..hello.len()].copy_from_slice(hello);
+        // write_data[..hello.len()].copy_from_slice(hello);
 
         // Write test
-        api.write(0, write_data.to_vec()).await.unwrap();
+        api.write(0, hello.to_vec()).await.unwrap();
 
         // Read test
-        let result = api.read(0, 3).await.unwrap();
+        let result = api.read(0, 14).await.unwrap();
 
         // Verify the contents
-        assert_eq!(&result[..hello.len()], hello);
         println!("Read data: {:?}", &result[..hello.len()]);
-        // As a string
         println!(
             "Read data (string): {}",
             String::from_utf8_lossy(&result[..hello.len()])
         );
+        assert_eq!(&result[..hello.len()], hello);
 
         Ok(())
     }
