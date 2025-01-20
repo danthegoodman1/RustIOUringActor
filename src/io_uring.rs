@@ -208,6 +208,8 @@ mod linux_impl {
             loop {
                 let mut responders = Vec::new();
                 let mut keep_alive_buffers = Vec::new(); // FIXME: This is a hack to keep the buffer alive
+                                                         // But in theory if we know the number of commands we'll receive, we can just
+                                                         // allocate a fixed number of buffers
                 match self.receiver.recv_async().await {
                     Ok(IOUringActorCommand::Read {
                         offset,
