@@ -1,6 +1,6 @@
 // Trait for aligned pages to implement
 #[cfg(target_os = "linux")]
-pub trait AlignedBuffer: Send {
+pub trait AlignedBuffer: Send + Sync {
     fn as_ptr(&self) -> *const u8;
     fn as_mut_ptr(&mut self) -> *mut u8;
     fn len(&self) -> usize;
@@ -46,9 +46,10 @@ mod linux_impl {
     use std::os::fd::AsRawFd;
 
     use super::AlignedBuffer;
-    use flume::{Receiver, Sender};
+    use flume::{Receiver, Sender, TryRecvError};
     use io_uring::{opcode, IoUring};
-    use tracing::{debug, warn};
+    use tokio::task::yield_now;
+    use tracing::{debug, info, warn};
 
     #[derive(Debug)]
     pub enum IOUringActorCommand {
@@ -205,72 +206,90 @@ mod linux_impl {
         // TODO: Delete (calls trim)
         async fn run(mut self) {
             debug!("Starting actor loop");
+            const MAX_COMMANDS: usize = 10; // TODO: Make this configurable
             loop {
                 let mut responders = Vec::new();
-                let mut keep_alive_buffers = Vec::new(); // FIXME: This is a hack to keep the buffer alive
-                                                         // But in theory if we know the number of commands we'll receive, we can just
-                                                         // allocate a fixed number of buffers
-                match self.receiver.recv_async().await {
-                    Ok(IOUringActorCommand::Read {
-                        offset,
-                        size,
-                        sender,
-                    }) => {
-                        debug!("Read: {:?}", offset);
-                        match self.handle_read(offset, size).await {
-                            Ok(result) => {
-                                responders.push((sender, IOUringActorResponse::Read(result)))
+                let mut commands = Vec::new();
+                for _ in 0..MAX_COMMANDS {
+                    match self.receiver.try_recv() {
+                        Ok(command) => commands.push(command),
+                        Err(e) => match e {
+                            TryRecvError::Disconnected => {
+                                info!("Actor disconnected, exiting");
+                                return;
                             }
-                            Err(e) => {
-                                debug!("handle_read error: {:?}", e);
-                                // We don't care if this fails because the channel is closed
-                                let _ = sender.send_async(Err(e)).await;
+                            TryRecvError::Empty => {
+                                debug!("Empty queue, breaking loop at {}", commands.len());
+                                break;
+                            }
+                        },
+                    }
+                }
+
+                if commands.is_empty() {
+                    // Yield to the scheduler to avoid busy-waiting
+                    yield_now().await;
+                    continue;
+                }
+
+                for command in &commands {
+                    match command {
+                        IOUringActorCommand::Read {
+                            offset,
+                            size,
+                            sender,
+                        } => {
+                            debug!("Read: {:?}", offset);
+                            match self.handle_read(*offset, *size).await {
+                                Ok(result) => {
+                                    responders.push((sender, IOUringActorResponse::Read(result)))
+                                }
+                                Err(e) => {
+                                    debug!("handle_read error: {:?}", e);
+                                    // We don't care if this fails because the channel is closed
+                                    let _ = sender.send_async(Err(e)).await;
+                                }
                             }
                         }
-                    }
 
-                    Ok(IOUringActorCommand::Write {
-                        offset,
-                        buffer,
-                        sender,
-                    }) => {
-                        debug!("WriteBlock: {:?}", offset);
-                        match self.handle_write(offset, &buffer).await {
-                            Ok(()) => {
-                                responders.push((sender, IOUringActorResponse::Write));
-                                keep_alive_buffers.push(buffer);
-                            }
-                            Err(e) => {
-                                debug!("handle_write error: {:?}", e);
-                                // We don't care if this fails because the channel is closed
-                                let _ = sender.send_async(Err(e)).await;
+                        IOUringActorCommand::Write {
+                            offset,
+                            buffer,
+                            sender,
+                        } => {
+                            debug!("WriteBlock: {:?}", offset);
+                            match self.handle_write(*offset, &buffer).await {
+                                Ok(()) => {
+                                    responders.push((sender, IOUringActorResponse::Write));
+                                    // keep_alive_buffers.push(buffer);
+                                }
+                                Err(e) => {
+                                    debug!("handle_write error: {:?}", e);
+                                    // We don't care if this fails because the channel is closed
+                                    let _ = sender.send_async(Err(e)).await;
+                                }
                             }
                         }
-                    }
 
-                    Ok(IOUringActorCommand::TrimBlock { offset, sender }) => {
-                        debug!("TrimBlock: {:?}", offset);
-                    }
+                        IOUringActorCommand::TrimBlock { offset, sender } => {
+                            debug!("TrimBlock: {:?}", offset);
+                        }
 
-                    Ok(IOUringActorCommand::ReadBlockDirect {
-                        offset,
-                        buffer,
-                        sender,
-                    }) => {
-                        debug!("ReadBlockDirect: {:?}", offset);
-                    }
+                        IOUringActorCommand::ReadBlockDirect {
+                            offset,
+                            buffer,
+                            sender,
+                        } => {
+                            debug!("ReadBlockDirect: {:?}", offset);
+                        }
 
-                    Ok(IOUringActorCommand::WriteBlockDirect {
-                        offset,
-                        buffer,
-                        sender,
-                    }) => {
-                        debug!("WriteBlockDirect: {:?}", offset);
-                    }
-
-                    Err(e) => {
-                        // Disconnected
-                        break;
+                        IOUringActorCommand::WriteBlockDirect {
+                            offset,
+                            buffer,
+                            sender,
+                        } => {
+                            debug!("WriteBlockDirect: {:?}", offset);
+                        }
                     }
                 }
 
@@ -498,11 +517,11 @@ mod tests {
         });
     }
 
-    // Test to ensure AlignedBuffer implements Send trait
+    // Test to ensure AlignedBuffer implements Send + Sync trait
     #[tokio::test]
     async fn test_aligned_buffer_is_send() {
         create_aligned_page!(Page4K, 4096);
-        fn assert_send<T: Send>() {}
+        fn assert_send<T: Send + Sync>() {}
         assert_send::<Page4K<4096>>();
     }
 
