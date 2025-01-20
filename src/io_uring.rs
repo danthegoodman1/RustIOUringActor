@@ -159,7 +159,9 @@ mod linux_impl {
             todo!()
         }
 
-        /// Write uses non-direct IO to write a buffer to the device.
+        /// write uses non-direct IO to write a buffer to the device.
+        /// write can optionally call fsync after the write operation, which is another io_uring operation.
+        /// If either of these operations fail, the operation will return an error, even if the write operation succeeded.
         #[instrument(skip_all, level = "debug")]
         pub async fn write(
             &self,
