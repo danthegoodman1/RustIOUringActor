@@ -49,7 +49,7 @@ mod linux_impl {
     use flume::{Receiver, Sender, TryRecvError};
     use io_uring::{opcode, IoUring};
     use tokio::task::yield_now;
-    use tracing::{debug, error, info, instrument};
+    use tracing::{debug, error, info, instrument, trace};
 
     #[derive(Debug)]
     pub enum IOUringActorCommand {
@@ -337,32 +337,38 @@ mod linux_impl {
 
                             // Definitely a better way to write this
                             if wait_for_extra > 0 {
-                                println!("Waiting for extra completion");
-                                // First we wait for a completion in the ring
-                                while self.ring.completion().is_empty() {
-                                    yield_now().await; // yield to the scheduler to avoid busy-waiting
-                                }
+                                trace!("Waiting for extra completion");
+                                for _ in 0..wait_for_extra {
+                                    // First we wait for a completion in the ring
+                                    while self.ring.completion().is_empty() {
+                                        yield_now().await; // yield to the scheduler to avoid busy-waiting
+                                    }
 
-                                let extra_result = self.ring.completion().next();
-                                let extra_result = match extra_result {
-                                    Some(cqe) => {
-                                        let result = if cqe.result() < 0 {
-                                            Err(std::io::Error::from_raw_os_error(-cqe.result()))
-                                        } else {
-                                            Ok(())
-                                        };
-                                        result
-                                    }
-                                    None => {
-                                        error!("No completion queue entry found");
-                                        Err(std::io::Error::new(
+                                    let extra_result = self.ring.completion().next();
+                                    let extra_result = match extra_result {
+                                        Some(cqe) => {
+                                            let result = if cqe.result() < 0 {
+                                                Err(std::io::Error::from_raw_os_error(
+                                                    -cqe.result(),
+                                                ))
+                                            } else {
+                                                Ok(())
+                                            };
+                                            result
+                                        }
+                                        None => {
+                                            error!(
+                                            "No completion queue entry found for extra operation"
+                                        );
+                                            Err(std::io::Error::new(
                                             std::io::ErrorKind::Other,
-                                            "No completion queue entry found for subsequent operation",
+                                            "No completion queue entry found for extra operation",
                                         ))
+                                        }
+                                    };
+                                    if let Err(e) = extra_result {
+                                        let _ = sender.send_async(Err(e)).await;
                                     }
-                                };
-                                if let Err(e) = extra_result {
-                                    let _ = sender.send_async(Err(e)).await;
                                 }
                             }
 
