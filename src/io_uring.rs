@@ -49,7 +49,7 @@ mod linux_impl {
     use flume::{Receiver, Sender, TryRecvError};
     use io_uring::{opcode, IoUring};
     use tokio::task::yield_now;
-    use tracing::{debug, info, warn};
+    use tracing::{debug, error, info};
 
     #[derive(Debug)]
     pub enum IOUringActorCommand {
@@ -293,29 +293,42 @@ mod linux_impl {
                     }
                 }
 
-                // TODO: instead of submit and wait, submit within the handler and then poll the completion queue with completion.is_empty() and yield_now if there are no completions
+                // Submit all commands at once
+                self.ring.submit().unwrap();
+
                 // Process completion - Modified to not hold completion queue across await
                 for (sender, response) in responders {
-                    // First we need to wait for the completion queue to have an entry
-                    self.ring.submit_and_wait(1).unwrap();
-                    let result = if let Some(cqe) = self.ring.completion().next() {
-                        if cqe.result() < 0 {
-                            debug!("Completion error: {:?}", cqe.result());
-                            Err(std::io::Error::from_raw_os_error(-cqe.result()))
-                        } else {
-                            Ok(response)
-                        }
-                    } else {
-                        println!("No completion queue entry found");
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "Invalid response",
-                        ))
-                    };
+                    // First we wait for a completion in the ring
+                    while self.ring.completion().is_empty() {
+                        yield_now().await; // yield to the scheduler to avoid busy-waiting
+                    }
 
-                    // Now we can await after we're done with the completion queue since it's not Send,
-                    // and we don't care about the result of the send
-                    let _ = sender.send_async(result).await;
+                    // We finally got an entry, let's take it
+                    let result = self.ring.completion().next();
+                    match result {
+                        Some(cqe) => {
+                            let result = if cqe.result() < 0 {
+                                debug!("Completion error: {:?}", cqe.result());
+                                Err(std::io::Error::from_raw_os_error(-cqe.result()))
+                            } else {
+                                Ok(response)
+                            };
+
+                            // Now we can await after we're done with the completion queue since it's not Send,
+                            // and we don't care about the result of the send
+                            let _ = sender.send_async(result).await;
+                        }
+                        None => {
+                            // TODO: better log on this
+                            error!("No completion queue entry found");
+                            let _ = sender
+                                .send_async(Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "No completion queue entry found",
+                                )))
+                                .await;
+                        }
+                    }
                 }
             }
         }
@@ -561,11 +574,6 @@ mod tests {
 
         // Create a new device instance
         let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
-
-        // Start by reading existing content
-        // Read test
-        let result = api.read(0, 3).await.unwrap();
-        println!("read result: {:?}", result);
 
         // Test data
         // let mut write_data = [0u8; 1033];
