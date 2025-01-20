@@ -62,6 +62,7 @@ mod linux_impl {
         Write {
             offset: u64,
             buffer: Vec<u8>,
+            fsync: bool,
             sender: Sender<std::io::Result<IOUringActorResponse>>,
         },
 
@@ -160,12 +161,18 @@ mod linux_impl {
 
         /// Write uses non-direct IO to write a buffer to the device.
         #[instrument(skip_all, level = "debug")]
-        pub async fn write(&self, offset: u64, buffer: Vec<u8>) -> std::io::Result<()> {
+        pub async fn write(
+            &self,
+            offset: u64,
+            buffer: Vec<u8>,
+            fsync: bool,
+        ) -> std::io::Result<()> {
             let (sender, receiver) = flume::unbounded();
             self.sender
                 .send_async(IOUringActorCommand::Write {
                     offset,
                     buffer,
+                    fsync,
                     sender,
                 })
                 .await
@@ -210,9 +217,13 @@ mod linux_impl {
             debug!("Starting actor loop");
             const MAX_COMMANDS: usize = 10; // TODO: Make this configurable
             loop {
-                let mut responders = Vec::new();
-                let mut commands = Vec::new();
-                for _ in 0..MAX_COMMANDS {
+                let mut responders: Vec<(
+                    &Sender<Result<IOUringActorResponse, std::io::Error>>,
+                    IOUringActorResponse,
+                    usize, // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
+                )> = Vec::new();
+                let mut commands = Vec::with_capacity(MAX_COMMANDS);
+                for i in 0..MAX_COMMANDS {
                     match self.receiver.try_recv() {
                         Ok(command) => commands.push(command),
                         Err(e) => match e {
@@ -244,7 +255,7 @@ mod linux_impl {
                             debug!("Read: {:?}", offset);
                             match self.handle_read(*offset, *size).await {
                                 Ok(result) => {
-                                    responders.push((sender, IOUringActorResponse::Read(result)))
+                                    responders.push((sender, IOUringActorResponse::Read(result), 0))
                                 }
                                 Err(e) => {
                                     debug!("handle_read error: {:?}", e);
@@ -257,13 +268,20 @@ mod linux_impl {
                         IOUringActorCommand::Write {
                             offset,
                             buffer,
+                            fsync,
                             sender,
                         } => {
                             debug!("WriteBlock: {:?}", offset);
-                            match self.handle_write(*offset, &buffer).await {
+                            match self.handle_write(*offset, &buffer, *fsync).await {
                                 Ok(()) => {
-                                    responders.push((sender, IOUringActorResponse::Write));
-                                    // keep_alive_buffers.push(buffer);
+                                    responders.push((
+                                        sender,
+                                        IOUringActorResponse::Write,
+                                        match fsync {
+                                            true => 1,
+                                            false => 0,
+                                        },
+                                    ));
                                 }
                                 Err(e) => {
                                     debug!("handle_write error: {:?}", e);
@@ -299,7 +317,8 @@ mod linux_impl {
                 self.ring.submit().unwrap();
 
                 // Process completion - Modified to not hold completion queue across await
-                for (sender, response) in responders {
+                // Process completion - Modified to not hold completion queue across await
+                for (sender, response, wait_for_extra) in responders {
                     // First we wait for a completion in the ring
                     while self.ring.completion().is_empty() {
                         yield_now().await; // yield to the scheduler to avoid busy-waiting
@@ -315,6 +334,37 @@ mod linux_impl {
                             } else {
                                 Ok(response)
                             };
+
+                            // Definitely a better way to write this
+                            if wait_for_extra > 0 {
+                                println!("Waiting for extra completion");
+                                // First we wait for a completion in the ring
+                                while self.ring.completion().is_empty() {
+                                    yield_now().await; // yield to the scheduler to avoid busy-waiting
+                                }
+
+                                let extra_result = self.ring.completion().next();
+                                let extra_result = match extra_result {
+                                    Some(cqe) => {
+                                        let result = if cqe.result() < 0 {
+                                            Err(std::io::Error::from_raw_os_error(-cqe.result()))
+                                        } else {
+                                            Ok(())
+                                        };
+                                        result
+                                    }
+                                    None => {
+                                        error!("No completion queue entry found");
+                                        Err(std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            "No completion queue entry found for subsequent operation",
+                                        ))
+                                    }
+                                };
+                                if let Err(e) = extra_result {
+                                    let _ = sender.send_async(Err(e)).await;
+                                }
+                            }
 
                             // Now we can await after we're done with the completion queue since it's not Send,
                             // and we don't care about the result of the send
@@ -398,7 +448,12 @@ mod linux_impl {
         }
 
         /// Writes data, returning after submission
-        async fn handle_write(&mut self, offset: u64, buffer: &[u8]) -> std::io::Result<()> {
+        async fn handle_write(
+            &mut self,
+            offset: u64,
+            buffer: &[u8],
+            fsync: bool,
+        ) -> std::io::Result<()> {
             // Submit the write
             let write_e = opcode::Write::new(self.fd, buffer.as_ptr(), buffer.len() as _)
                 .offset(offset)
@@ -412,16 +467,19 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            // TODO: Add an fsync operation, maybe return "skip" responses and we can have None's that don't get sent?
-            // // Add an fsync operation
-            // let fsync_e = opcode::Fsync::new(self.fd).build().user_data(0x44);
+            if !fsync {
+                return Ok(());
+            }
 
-            // unsafe {
-            //     self.ring
-            //         .submission()
-            //         .push(&fsync_e)
-            //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            // }
+            // Add an fsync operation
+            let fsync_e = opcode::Fsync::new(self.fd).build().user_data(0x44);
+
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&fsync_e)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
 
             Ok(())
         }
@@ -577,11 +635,26 @@ mod tests {
         let hello = b"Hello, world!\n";
         // write_data[..hello.len()].copy_from_slice(hello);
 
-        // Write test
-        api.write(0, hello.to_vec()).await.unwrap();
+        // Write test (without fsync)
+        api.write(0, hello.to_vec(), false).await.unwrap();
 
         // Read test
         let result = api.read(0, 14).await.unwrap();
+
+        // Verify the contents
+        println!("Read data: {:?}", &result[..hello.len()]);
+        println!(
+            "Read data (string): {}",
+            String::from_utf8_lossy(&result[..hello.len()])
+        );
+        assert_eq!(&result[..hello.len()], hello);
+
+        // Write test (with fsync)
+        let hello = b"Hello, world again!\n";
+        api.write(0, hello.to_vec(), true).await.unwrap();
+
+        // Read test
+        let result = api.read(0, 20).await.unwrap();
 
         // Verify the contents
         println!("Read data: {:?}", &result[..hello.len()]);
