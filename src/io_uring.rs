@@ -43,13 +43,13 @@ macro_rules! create_aligned_page {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use std::os::fd::AsRawFd;
+    use std::{collections::VecDeque, os::fd::AsRawFd};
 
     use super::AlignedBuffer;
     use flume::{Receiver, Sender, TryRecvError};
-    use io_uring::{opcode, CompletionQueue, IoUring, SubmissionQueue};
+    use io_uring::{opcode, IoUring};
     use tokio::task::yield_now;
-    use tracing::{debug, error, info, instrument, trace, warn};
+    use tracing::{debug, error, info, instrument, trace};
 
     #[derive(Debug)]
     pub enum IOUringActorCommand {
@@ -211,197 +211,205 @@ mod linux_impl {
         receiver: Receiver<IOUringActorCommand>,
     }
 
-    impl<'a, const BLOCK_SIZE: usize> IOUringActor<BLOCK_SIZE> {
-        // TODO: Read
-        // TODO: Write
-        // TODO: Delete (calls trim)
+    impl<const BLOCK_SIZE: usize> IOUringActor<BLOCK_SIZE> {
+        /// run starts the actor loop, that will flip between consuming commands from the receiver,
+        /// submitting them to the ring, polling completions, and sending responses back to the caller.
         async fn run(mut self) {
             debug!("Starting actor loop");
-            let (completion_sender, completion_receiver) = flume::unbounded::<(
-                &Sender<Result<IOUringActorResponse, std::io::Error>>,
-                IOUringActorResponse,
-                i32,
-            )>();
-
-            // Create a separate task that only processes completions
-            let completion_queue = self.ring.completion();
-            let submission_queue = self.ring.submission();
-            tokio::spawn(async move {
-                loop {
-                    // Wait for a completion request
-                    let (sender, response, wait_for_extra) =
-                        match completion_receiver.recv_async().await {
-                            Ok(result) => result,
-                            Err(_) => {
-                                info!("Completion receiver disconnected");
-                                return;
-                            }
-                        };
-
-                    // Process the completion without holding across await points
-                    let mut result = None;
-
-                    // Wait for completion
-                    while completion_queue.is_empty() {
-                        yield_now().await;
-                    }
-
-                    // Process the completion
-                    if let Some(cqe) = completion_queue.next() {
-                        result = Some(if cqe.result() < 0 {
-                            Err(std::io::Error::from_raw_os_error(-cqe.result()))
-                        } else {
-                            Ok(response)
-                        });
-                    }
-
-                    // Handle extra completions if needed
-                    if wait_for_extra > 0 && result.as_ref().map_or(false, |r| r.is_ok()) {
-                        for _ in 0..wait_for_extra {
-                            while completion_queue.is_empty() {
-                                yield_now().await;
-                            }
-
-                            if let Some(cqe) = completion_queue.next() {
-                                if cqe.result() < 0 {
-                                    result =
-                                        Some(Err(std::io::Error::from_raw_os_error(-cqe.result())));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Send the final result
-                    let result = result.unwrap_or_else(|| {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "No completion queue entry found",
-                        ))
-                    });
-                    let _ = sender.send_async(result).await;
-                }
-            });
-
             const MAX_COMMANDS: usize = 10; // TODO: Make this configurable
             loop {
-                let mut responders: Vec<(
-                    &Sender<Result<IOUringActorResponse, std::io::Error>>,
+                let mut responders: VecDeque<(
+                    Sender<Result<IOUringActorResponse, std::io::Error>>,
                     IOUringActorResponse,
                     usize, // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
-                )> = Vec::new();
-                let mut commands = Vec::with_capacity(MAX_COMMANDS);
-                for i in 0..MAX_COMMANDS {
-                    match self.receiver.try_recv() {
-                        Ok(command) => commands.push(command),
-                        Err(e) => match e {
-                            TryRecvError::Disconnected => {
-                                info!("Actor disconnected, exiting");
-                                return;
-                            }
-                            TryRecvError::Empty => {
-                                debug!("Empty queue, breaking loop at {}", commands.len());
-                                break;
-                            }
-                        },
+                )> = VecDeque::with_capacity(MAX_COMMANDS);
+
+                let command = match self.receiver.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(e) => match e {
+                        TryRecvError::Disconnected => {
+                            info!("Actor disconnected, exiting");
+                            return;
+                        }
+                        TryRecvError::Empty => {
+                            trace!("Empty queue");
+                            None
+                        }
+                    },
+                };
+
+                // If we got a command, let's submit it and add it to the responders queue
+                if let Some(command) = command {
+                    debug!("Submitting command");
+                    if let Ok(result) = self.queue_command(command).await {
+                        responders.push_back(result);
+                        self.ring.submit().expect("Failed to submit command");
+                        debug!("Command submitted");
                     }
+                    // We already sent the error back to the caller, so we can continue
+                } else {
+                    trace!("No command to submit");
                 }
-
-                if commands.is_empty() {
-                    // Yield to the scheduler to avoid busy-waiting
-                    yield_now().await;
-                    continue;
+                // println!(
+                //     "ring: {:?} responders: {:?}",
+                //     self.ring.completion().len(),
+                //     responders.len()
+                // );
+                if responders.len() > 0 && !self.ring.completion().is_empty() {
+                    println!("Checking for completion");
                 }
+                // If we have responders, let's check if the tasks are completed
+                while responders.len() > 0 && !self.ring.completion().is_empty() {
+                    println!("Checking for completion");
+                    let (sender, response, wait_for_extra) = responders.pop_front().unwrap();
+                    // We finally got an entry, let's take it
+                    let result = self.ring.completion().next();
+                    match result {
+                        Some(cqe) => {
+                            let result = if cqe.result() < 0 {
+                                debug!("Completion error: {:?}", cqe.result());
+                                Err(std::io::Error::from_raw_os_error(-cqe.result()))
+                            } else {
+                                Ok(response)
+                            };
 
-                for command in &commands {
-                    let response = match command {
-                        IOUringActorCommand::Read {
-                            offset,
-                            size,
-                            sender,
-                        } => {
-                            debug!("Read: {:?}", offset);
-                            match self
-                                .handle_read(&mut submission_queue, *offset, *size)
-                                .await
-                            {
-                                Ok(result) => (sender, IOUringActorResponse::Read(result), 0),
-                                Err(e) => {
-                                    debug!("handle_read error: {:?}", e);
-                                    // We don't care if this fails because the channel is closed
-                                    let _ = sender.send_async(Err(e)).await;
-                                    continue;
+                            // Definitely a better way to write this
+                            if wait_for_extra > 0 {
+                                trace!("Waiting for extra completion");
+                                for _ in 0..wait_for_extra {
+                                    // First we wait for a completion in the ring
+                                    while self.ring.completion().is_empty() {
+                                        yield_now().await; // yield to the scheduler to avoid busy-waiting
+                                    }
+
+                                    let extra_result = self.ring.completion().next();
+                                    let extra_result = match extra_result {
+                                        Some(cqe) => {
+                                            let result = if cqe.result() < 0 {
+                                                Err(std::io::Error::from_raw_os_error(
+                                                    -cqe.result(),
+                                                ))
+                                            } else {
+                                                Ok(())
+                                            };
+                                            result
+                                        }
+                                        None => {
+                                            error!(
+                                                "No completion queue entry found for extra operation"
+                                            );
+                                            Err(std::io::Error::new(
+                                                std::io::ErrorKind::Other,
+                                                "No completion queue entry found for extra operation",
+                                            ))
+                                        }
+                                    };
+                                    if let Err(e) = extra_result {
+                                        let _ = sender.send_async(Err(e)).await;
+                                    }
                                 }
                             }
+
+                            // Now we can await after we're done with the completion queue since it's not Send,
+                            // and we don't care about the result of the send
+                            let _ = sender.send_async(result).await;
                         }
-
-                        IOUringActorCommand::Write {
-                            offset,
-                            buffer,
-                            fsync,
-                            sender,
-                        } => {
-                            debug!("WriteBlock: {:?}", offset);
-                            match self
-                                .handle_write(&mut submission_queue, *offset, &buffer, *fsync)
-                                .await
-                            {
-                                Ok(()) => (
-                                    sender,
-                                    IOUringActorResponse::Write,
-                                    match fsync {
-                                        true => 1,
-                                        false => 0,
-                                    },
-                                ),
-                                Err(e) => {
-                                    debug!("handle_write error: {:?}", e);
-                                    // We don't care if this fails because the channel is closed
-                                    let _ = sender.send_async(Err(e)).await;
-                                    continue;
-                                }
-                            }
+                        None => {
+                            // TODO: better log on this
+                            error!("No completion queue entry found");
+                            let _ = sender
+                                .send_async(Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "No completion queue entry found",
+                                )))
+                                .await;
                         }
-
-                        IOUringActorCommand::TrimBlock { offset, sender } => {
-                            debug!("TrimBlock: {:?}", offset);
-                            todo!()
-                        }
-
-                        IOUringActorCommand::ReadBlockDirect {
-                            offset,
-                            buffer,
-                            sender,
-                        } => {
-                            debug!("ReadBlockDirect: {:?}", offset);
-                            todo!()
-                        }
-
-                        IOUringActorCommand::WriteBlockDirect {
-                            offset,
-                            buffer,
-                            sender,
-                        } => {
-                            debug!("WriteBlockDirect: {:?}", offset);
-                            todo!()
-                        }
-                    };
-
-                    // Submit to the ring
-                    self.ring.submit().unwrap();
-
-                    // Pass to the completion loop
-                    completion_sender.send_async(response).await.unwrap();
+                    }
                 }
             }
         }
 
-        async fn handle_read(
+        async fn queue_command(
             &mut self,
-            submission_queue: &mut SubmissionQueue<'a>,
-            offset: u64,
-            size: usize,
-        ) -> std::io::Result<Vec<u8>> {
+            command: IOUringActorCommand,
+        ) -> std::io::Result<(
+            Sender<Result<IOUringActorResponse, std::io::Error>>,
+            IOUringActorResponse,
+            usize, // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
+        )> {
+            match command {
+                IOUringActorCommand::Read {
+                    offset,
+                    size,
+                    sender,
+                } => {
+                    debug!("Read: {:?}", offset);
+                    match self.handle_read(offset, size).await {
+                        Ok(result) => Ok((sender, IOUringActorResponse::Read(result), 0)),
+                        Err(e) => {
+                            debug!("handle_read error: {:?}", e);
+                            let _ = sender.send_async(Err(e)).await;
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "handle_read error",
+                            ))
+                        }
+                    }
+                }
+
+                IOUringActorCommand::Write {
+                    offset,
+                    buffer,
+                    fsync,
+                    sender,
+                } => {
+                    debug!("Write: {:?}", offset);
+                    match self.handle_write(offset, &buffer, fsync).await {
+                        Ok(()) => Ok((
+                            sender,
+                            IOUringActorResponse::Write,
+                            match fsync {
+                                true => 1,
+                                false => 0,
+                            },
+                        )),
+                        Err(e) => {
+                            debug!("handle_write error: {:?}", e);
+                            let _ = sender.send_async(Err(e)).await;
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "handle_write error",
+                            ))
+                        }
+                    }
+                }
+
+                IOUringActorCommand::TrimBlock { offset, sender } => {
+                    debug!("TrimBlock: {:?}", offset);
+                    todo!()
+                }
+
+                IOUringActorCommand::ReadBlockDirect {
+                    offset,
+                    buffer,
+                    sender,
+                } => {
+                    debug!("ReadBlockDirect: {:?}", offset);
+                    todo!()
+                }
+
+                IOUringActorCommand::WriteBlockDirect {
+                    offset,
+                    buffer,
+                    sender,
+                } => {
+                    debug!("WriteBlockDirect: {:?}", offset);
+                    todo!()
+                }
+            }
+        }
+
+        async fn handle_read(&mut self, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
             let mut buffer = vec![0u8; size];
             let read_e = opcode::Read::new(self.fd, buffer.as_mut_ptr(), buffer.len() as _)
                 .offset(offset)
@@ -409,10 +417,25 @@ mod linux_impl {
                 .user_data(0x42);
 
             unsafe {
-                submission_queue
+                self.ring
+                    .submission()
                     .push(&read_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
+
+            // self.ring.submit()?;
+
+            // TODO: just submit and let caller wait
+            // self.ring.submit_and_wait(1)?;
+
+            // // Process completion
+            // while let Some(cqe) = self.ring.completion().next() {
+            //     if cqe.result() < 0 {
+            //         return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+            //     }
+            // }
+
+            // println!("Read completed {:?}", buffer);
 
             Ok(buffer)
         }
@@ -420,7 +443,6 @@ mod linux_impl {
         /// Reads a block from the device into the given buffer.
         async fn handle_read_direct<T: AlignedBuffer>(
             &mut self,
-            submission_queue: &mut SubmissionQueue<'a>,
             offset: u64,
             buffer: &mut T,
         ) -> std::io::Result<()> {
@@ -430,9 +452,20 @@ mod linux_impl {
                 .user_data(0x42);
 
             unsafe {
-                submission_queue
+                self.ring
+                    .submission()
                     .push(&read_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+
+            // TODO: just submit and let caller wait
+            self.ring.submit_and_wait(1)?;
+
+            // Process completion
+            while let Some(cqe) = self.ring.completion().next() {
+                if cqe.result() < 0 {
+                    return Err(std::io::Error::from_raw_os_error(-cqe.result()));
+                }
             }
 
             Ok(())
@@ -440,8 +473,7 @@ mod linux_impl {
 
         /// Writes data, returning after submission
         async fn handle_write(
-            &self,
-            submission_queue: &mut SubmissionQueue<'a>,
+            &mut self,
             offset: u64,
             buffer: &[u8],
             fsync: bool,
@@ -453,7 +485,8 @@ mod linux_impl {
                 .user_data(0x43);
 
             unsafe {
-                submission_queue
+                self.ring
+                    .submission()
                     .push(&write_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
@@ -466,7 +499,8 @@ mod linux_impl {
             let fsync_e = opcode::Fsync::new(self.fd).build().user_data(0x44);
 
             unsafe {
-                submission_queue
+                self.ring
+                    .submission()
                     .push(&fsync_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
