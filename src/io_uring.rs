@@ -219,9 +219,12 @@ mod linux_impl {
             const MAX_COMMANDS: usize = 10; // TODO: Make this configurable
             loop {
                 let mut responders: VecDeque<(
-                    Sender<Result<IOUringActorResponse, std::io::Error>>,
-                    IOUringActorResponse,
-                    usize, // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
+                    IOUringActorCommand,
+                    (
+                        Sender<Result<IOUringActorResponse, std::io::Error>>,
+                        IOUringActorResponse,
+                        usize, // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
+                    ),
                 )> = VecDeque::with_capacity(MAX_COMMANDS);
 
                 let command = match self.receiver.try_recv() {
@@ -242,7 +245,7 @@ mod linux_impl {
                 if let Some(command) = command {
                     debug!("Submitting command");
                     if let Ok(result) = self.queue_command(command).await {
-                        responders.push_back(result);
+                        responders.push_back((command, result));
                         self.ring.submit().expect("Failed to submit command");
                         debug!("Command submitted");
                     }
@@ -255,21 +258,28 @@ mod linux_impl {
                 //     self.ring.completion().len(),
                 //     responders.len()
                 // );
-                if responders.len() > 0 && !self.ring.completion().is_empty() {
-                    println!("Checking for completion");
-                }
+                // if self.ring.completion().len() > 0 && responders.len() > 0 {
+                //     println!("Checking for completion");
+                // }
                 // If we have responders, let's check if the tasks are completed
-                while responders.len() > 0 && !self.ring.completion().is_empty() {
-                    println!("Checking for completion");
-                    let (sender, response, wait_for_extra) = responders.pop_front().unwrap();
+                while self.ring.completion().len() > 0 && responders.len() > 0 {
+                    debug!(
+                        "Checking for completion {:?} {:?}",
+                        responders.len(),
+                        self.ring.completion().len()
+                    );
+                    let (command, (sender, response, wait_for_extra)) =
+                        responders.pop_front().unwrap();
                     // We finally got an entry, let's take it
                     let result = self.ring.completion().next();
+                    debug!("result: {:?}", result);
                     match result {
                         Some(cqe) => {
                             let result = if cqe.result() < 0 {
                                 debug!("Completion error: {:?}", cqe.result());
                                 Err(std::io::Error::from_raw_os_error(-cqe.result()))
                             } else {
+                                debug!("Completion success: {:?}", cqe.result());
                                 Ok(response)
                             };
 
@@ -312,7 +322,11 @@ mod linux_impl {
 
                             // Now we can await after we're done with the completion queue since it's not Send,
                             // and we don't care about the result of the send
-                            let _ = sender.send_async(result).await;
+                            // sender.send_async(result).await.unwrap();
+                            match sender.try_send(result) {
+                                Ok(()) => debug!("Sent response"),
+                                Err(e) => error!("Failed to send response: {:?}", e),
+                            }
                         }
                         None => {
                             // TODO: better log on this
@@ -326,6 +340,7 @@ mod linux_impl {
                         }
                     }
                 }
+                yield_now().await;
             }
         }
 
@@ -663,6 +678,7 @@ mod tests {
         api.write(0, hello.to_vec(), false).await.unwrap();
 
         // Read test
+        println!("Reading");
         let result = api.read(0, 14).await.unwrap();
 
         // Verify the contents
