@@ -259,14 +259,7 @@ mod linux_impl {
                 } else {
                     trace!("No command to submit");
                 }
-                // println!(
-                //     "ring: {:?} responders: {:?}",
-                //     self.ring.completion().len(),
-                //     responders.len()
-                // );
-                // if self.ring.completion().len() > 0 && responders.len() > 0 {
-                //     println!("Checking for completion");
-                // }
+
                 // If we have responders, let's check if the tasks are completed
                 while self.ring.completion().len() > 0 && responders.len() > 0 {
                     trace!(
@@ -442,20 +435,6 @@ mod linux_impl {
                     .push(&read_e)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
-
-            // self.ring.submit()?;
-
-            // TODO: just submit and let caller wait
-            // self.ring.submit_and_wait(1)?;
-
-            // // Process completion
-            // while let Some(cqe) = self.ring.completion().next() {
-            //     if cqe.result() < 0 {
-            //         return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-            //     }
-            // }
-
-            // println!("Read completed {:?}", buffer);
 
             Ok(buffer)
         }
