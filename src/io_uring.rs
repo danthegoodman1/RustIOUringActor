@@ -85,6 +85,16 @@ mod linux_impl {
         },
     }
 
+    impl IOUringActorCommand {
+        pub fn sender(&self) -> &Sender<Result<IOUringActorResponse, std::io::Error>> {
+            match self {
+                IOUringActorCommand::Read { sender, .. } => sender,
+                IOUringActorCommand::Write { sender, .. } => sender,
+                _ => unreachable!(),
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub enum IOUringActorResponse {
         // Non-direct
@@ -217,16 +227,13 @@ mod linux_impl {
         async fn run(mut self) {
             debug!("Starting actor loop");
             const MAX_COMMANDS: usize = 10; // TODO: Make this configurable
+            let mut responders: VecDeque<(
+                IOUringActorResponse,
+                usize, // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
+            )> = VecDeque::with_capacity(MAX_COMMANDS);
+            let mut pending_commands: VecDeque<IOUringActorCommand> =
+                VecDeque::with_capacity(MAX_COMMANDS); // hack to keep command in scope (and thus buffer)
             loop {
-                let mut responders: VecDeque<(
-                    IOUringActorCommand,
-                    (
-                        Sender<Result<IOUringActorResponse, std::io::Error>>,
-                        IOUringActorResponse,
-                        usize, // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
-                    ),
-                )> = VecDeque::with_capacity(MAX_COMMANDS);
-
                 let command = match self.receiver.try_recv() {
                     Ok(command) => Some(command),
                     Err(e) => match e {
@@ -244,9 +251,10 @@ mod linux_impl {
                 // If we got a command, let's submit it and add it to the responders queue
                 if let Some(command) = command {
                     debug!("Submitting command");
-                    if let Ok(result) = self.queue_command(command).await {
-                        responders.push_back((command, result));
+                    if let Ok(result) = self.queue_command(&command).await {
+                        responders.push_back(result);
                         self.ring.submit().expect("Failed to submit command");
+                        pending_commands.push_back(command);
                         debug!("Command submitted");
                     }
                     // We already sent the error back to the caller, so we can continue
@@ -268,8 +276,9 @@ mod linux_impl {
                         responders.len(),
                         self.ring.completion().len()
                     );
-                    let (command, (sender, response, wait_for_extra)) =
-                        responders.pop_front().unwrap();
+                    let (response, wait_for_extra) = responders.pop_front().unwrap();
+                    let command = pending_commands.pop_front().unwrap();
+                    let sender = command.sender();
                     // We finally got an entry, let's take it
                     let result = self.ring.completion().next();
                     debug!("result: {:?}", result);
@@ -340,15 +349,14 @@ mod linux_impl {
                         }
                     }
                 }
-                yield_now().await;
+                yield_now().await; // so we don't lock up the thread
             }
         }
 
         async fn queue_command(
             &mut self,
-            command: IOUringActorCommand,
+            command: &IOUringActorCommand,
         ) -> std::io::Result<(
-            Sender<Result<IOUringActorResponse, std::io::Error>>,
             IOUringActorResponse,
             usize, // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
         )> {
@@ -359,8 +367,8 @@ mod linux_impl {
                     sender,
                 } => {
                     debug!("Read: {:?}", offset);
-                    match self.handle_read(offset, size).await {
-                        Ok(result) => Ok((sender, IOUringActorResponse::Read(result), 0)),
+                    match self.handle_read(*offset, *size).await {
+                        Ok(result) => Ok((IOUringActorResponse::Read(result), 0)),
                         Err(e) => {
                             debug!("handle_read error: {:?}", e);
                             let _ = sender.send_async(Err(e)).await;
@@ -379,9 +387,8 @@ mod linux_impl {
                     sender,
                 } => {
                     debug!("Write: {:?}", offset);
-                    match self.handle_write(offset, &buffer, fsync).await {
+                    match self.handle_write(*offset, &buffer, *fsync).await {
                         Ok(()) => Ok((
-                            sender,
                             IOUringActorResponse::Write,
                             match fsync {
                                 true => 1,
