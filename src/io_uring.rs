@@ -47,9 +47,9 @@ mod linux_impl {
 
     use super::AlignedBuffer;
     use flume::{Receiver, Sender, TryRecvError};
-    use io_uring::{opcode, IoUring};
+    use io_uring::{opcode, CompletionQueue, IoUring};
     use tokio::task::yield_now;
-    use tracing::{debug, error, info, instrument, trace};
+    use tracing::{debug, error, info, instrument, trace, warn};
 
     #[derive(Debug)]
     pub enum IOUringActorCommand {
@@ -217,6 +217,8 @@ mod linux_impl {
         // TODO: Delete (calls trim)
         async fn run(mut self) {
             debug!("Starting actor loop");
+            let (completion_sender, completion_receiver) = flume::unbounded();
+            tokio::spawn(self.completion_loop(self.ring.completion_shared(), completion_receiver));
             const MAX_COMMANDS: usize = 10; // TODO: Make this configurable
             loop {
                 let mut responders: Vec<(
@@ -248,7 +250,7 @@ mod linux_impl {
                 }
 
                 for command in &commands {
-                    match command {
+                    let response = match command {
                         IOUringActorCommand::Read {
                             offset,
                             size,
@@ -256,13 +258,12 @@ mod linux_impl {
                         } => {
                             debug!("Read: {:?}", offset);
                             match self.handle_read(*offset, *size).await {
-                                Ok(result) => {
-                                    responders.push((sender, IOUringActorResponse::Read(result), 0))
-                                }
+                                Ok(result) => (sender, IOUringActorResponse::Read(result), 0),
                                 Err(e) => {
                                     debug!("handle_read error: {:?}", e);
                                     // We don't care if this fails because the channel is closed
                                     let _ = sender.send_async(Err(e)).await;
+                                    continue;
                                 }
                             }
                         }
@@ -275,26 +276,26 @@ mod linux_impl {
                         } => {
                             debug!("WriteBlock: {:?}", offset);
                             match self.handle_write(*offset, &buffer, *fsync).await {
-                                Ok(()) => {
-                                    responders.push((
-                                        sender,
-                                        IOUringActorResponse::Write,
-                                        match fsync {
-                                            true => 1,
-                                            false => 0,
-                                        },
-                                    ));
-                                }
+                                Ok(()) => (
+                                    sender,
+                                    IOUringActorResponse::Write,
+                                    match fsync {
+                                        true => 1,
+                                        false => 0,
+                                    },
+                                ),
                                 Err(e) => {
                                     debug!("handle_write error: {:?}", e);
                                     // We don't care if this fails because the channel is closed
                                     let _ = sender.send_async(Err(e)).await;
+                                    continue;
                                 }
                             }
                         }
 
                         IOUringActorCommand::TrimBlock { offset, sender } => {
                             debug!("TrimBlock: {:?}", offset);
+                            todo!()
                         }
 
                         IOUringActorCommand::ReadBlockDirect {
@@ -303,6 +304,7 @@ mod linux_impl {
                             sender,
                         } => {
                             debug!("ReadBlockDirect: {:?}", offset);
+                            todo!()
                         }
 
                         IOUringActorCommand::WriteBlockDirect {
@@ -311,84 +313,98 @@ mod linux_impl {
                             sender,
                         } => {
                             debug!("WriteBlockDirect: {:?}", offset);
+                            todo!()
                         }
-                    }
+                    };
+
+                    // Submit to the ring
+                    self.ring.submit().unwrap();
+
+                    // Pass to the completion loop
+                    completion_sender.send_async(response).await.unwrap();
                 }
+            }
+        }
 
-                // Submit all commands at once
-                self.ring.submit().unwrap();
+        async fn completion_loop(
+            &mut self,
+            mut ceq: CompletionQueue<'_>,
+            completion_receiver: Receiver<(
+                flume::Sender<Result<IOUringActorResponse, std::io::Error>>,
+                IOUringActorResponse,
+                usize,
+            )>,
+        ) {
+            // Process completion - Modified to not hold completion queue across await
+            let (sender, response, wait_for_extra) = match completion_receiver.recv_async().await {
+                Ok(result) => result,
+                Err(e) => {
+                    info!("Completion receiver disconnected");
+                    return;
+                }
+            };
+            // First we wait for a completion in the ring
+            while ceq.is_empty() {
+                yield_now().await; // yield to the scheduler to avoid busy-waiting
+            }
 
-                // Process completion - Modified to not hold completion queue across await
-                // Process completion - Modified to not hold completion queue across await
-                for (sender, response, wait_for_extra) in responders {
-                    // First we wait for a completion in the ring
-                    while self.ring.completion().is_empty() {
-                        yield_now().await; // yield to the scheduler to avoid busy-waiting
-                    }
+            // We finally got an entry, let's take it
+            let result = ceq.next();
+            match result {
+                Some(cqe) => {
+                    let result = if cqe.result() < 0 {
+                        debug!("Completion error: {:?}", cqe.result());
+                        Err(std::io::Error::from_raw_os_error(-cqe.result()))
+                    } else {
+                        Ok(response)
+                    };
 
-                    // We finally got an entry, let's take it
-                    let result = self.ring.completion().next();
-                    match result {
-                        Some(cqe) => {
-                            let result = if cqe.result() < 0 {
-                                debug!("Completion error: {:?}", cqe.result());
-                                Err(std::io::Error::from_raw_os_error(-cqe.result()))
-                            } else {
-                                Ok(response)
-                            };
-
-                            // Definitely a better way to write this
-                            if wait_for_extra > 0 {
-                                trace!("Waiting for extra completion");
-                                for _ in 0..wait_for_extra {
-                                    // First we wait for a completion in the ring
-                                    while self.ring.completion().is_empty() {
-                                        yield_now().await; // yield to the scheduler to avoid busy-waiting
-                                    }
-
-                                    let extra_result = self.ring.completion().next();
-                                    let extra_result = match extra_result {
-                                        Some(cqe) => {
-                                            let result = if cqe.result() < 0 {
-                                                Err(std::io::Error::from_raw_os_error(
-                                                    -cqe.result(),
-                                                ))
-                                            } else {
-                                                Ok(())
-                                            };
-                                            result
-                                        }
-                                        None => {
-                                            error!(
-                                            "No completion queue entry found for extra operation"
-                                        );
-                                            Err(std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            "No completion queue entry found for extra operation",
-                                        ))
-                                        }
-                                    };
-                                    if let Err(e) = extra_result {
-                                        let _ = sender.send_async(Err(e)).await;
-                                    }
-                                }
+                    // Definitely a better way to write this
+                    if wait_for_extra > 0 {
+                        trace!("Waiting for extra completion");
+                        for _ in 0..wait_for_extra {
+                            // First we wait for a completion in the ring
+                            while ceq.is_empty() {
+                                yield_now().await; // yield to the scheduler to avoid busy-waiting
                             }
 
-                            // Now we can await after we're done with the completion queue since it's not Send,
-                            // and we don't care about the result of the send
-                            let _ = sender.send_async(result).await;
-                        }
-                        None => {
-                            // TODO: better log on this
-                            error!("No completion queue entry found");
-                            let _ = sender
-                                .send_async(Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    "No completion queue entry found",
-                                )))
-                                .await;
+                            let extra_result = ceq.next();
+                            let extra_result = match extra_result {
+                                Some(cqe) => {
+                                    let result = if cqe.result() < 0 {
+                                        Err(std::io::Error::from_raw_os_error(-cqe.result()))
+                                    } else {
+                                        Ok(())
+                                    };
+                                    result
+                                }
+                                None => {
+                                    error!("No completion queue entry found for extra operation");
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "No completion queue entry found for extra operation",
+                                    ))
+                                }
+                            };
+                            if let Err(e) = extra_result {
+                                let _ = sender.send_async(Err(e)).await;
+                            }
                         }
                     }
+
+                    // Now we can await after we're done with the completion queue since it's not Send,
+                    // and we don't care about the result of the send
+                    let _ = sender.send_async(result).await;
+                }
+                None => {
+                    // TODO: better log on this
+                    error!("No completion queue entry found");
+                    let _ = sender
+                        .send_async(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "No completion queue entry found",
+                        )))
+                        .await;
                 }
             }
         }
