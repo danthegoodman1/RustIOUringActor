@@ -151,7 +151,6 @@ mod linux_impl {
                 .await
                 .unwrap();
             let response = receiver.recv_async().await.unwrap();
-            println!("Read response: {:?}", response);
             match response {
                 Ok(IOUringActorResponse::Read(result)) => Ok(result),
                 _ => Err(std::io::Error::new(
@@ -172,7 +171,7 @@ mod linux_impl {
         /// write uses non-direct IO to write a buffer to the device.
         /// write can optionally call fsync after the write operation, which is another io_uring operation.
         /// If either of these operations fail, the operation will return an error, even if the write operation succeeded.
-        #[instrument(skip_all, level = "debug")]
+        #[instrument(skip(self, offset, buffer), level = "debug")]
         pub async fn write(
             &self,
             offset: u64,
@@ -190,7 +189,6 @@ mod linux_impl {
                 .await
                 .unwrap();
             let response = receiver.recv_async().await.unwrap();
-            println!("Write response: {:?}", response);
             match response {
                 Ok(IOUringActorResponse::Write) => Ok(()),
                 _ => Err(std::io::Error::new(
@@ -250,12 +248,12 @@ mod linux_impl {
 
                 // If we got a command, let's submit it and add it to the responders queue
                 if let Some(command) = command {
-                    debug!("Submitting command");
+                    trace!("Submitting command");
                     if let Ok(result) = self.queue_command(&command).await {
                         responders.push_back(result);
                         self.ring.submit().expect("Failed to submit command");
                         pending_commands.push_back(command);
-                        debug!("Command submitted");
+                        trace!("Command submitted");
                     }
                     // We already sent the error back to the caller, so we can continue
                 } else {
@@ -271,7 +269,7 @@ mod linux_impl {
                 // }
                 // If we have responders, let's check if the tasks are completed
                 while self.ring.completion().len() > 0 && responders.len() > 0 {
-                    debug!(
+                    trace!(
                         "Checking for completion {:?} {:?}",
                         responders.len(),
                         self.ring.completion().len()
@@ -281,14 +279,14 @@ mod linux_impl {
                     let sender = command.sender();
                     // We finally got an entry, let's take it
                     let result = self.ring.completion().next();
-                    debug!("result: {:?}", result);
+                    trace!("result: {:?}", result);
                     match result {
                         Some(cqe) => {
                             let result = if cqe.result() < 0 {
-                                debug!("Completion error: {:?}", cqe.result());
+                                trace!("Completion error: {:?}", cqe.result());
                                 Err(std::io::Error::from_raw_os_error(-cqe.result()))
                             } else {
-                                debug!("Completion success: {:?}", cqe.result());
+                                trace!("Completion success: {:?}", cqe.result());
                                 Ok(response)
                             };
 
@@ -331,11 +329,11 @@ mod linux_impl {
 
                             // Now we can await after we're done with the completion queue since it's not Send,
                             // and we don't care about the result of the send
-                            // sender.send_async(result).await.unwrap();
-                            match sender.try_send(result) {
-                                Ok(()) => debug!("Sent response"),
-                                Err(e) => error!("Failed to send response: {:?}", e),
-                            }
+                            let _ = sender.send_async(result).await;
+                            // match sender.try_send(result) {
+                            //     Ok(()) => debug!("Sent response"),
+                            //     Err(e) => error!("Failed to send response: {:?}", e),
+                            // }
                         }
                         None => {
                             // TODO: better log on this
@@ -366,7 +364,7 @@ mod linux_impl {
                     size,
                     sender,
                 } => {
-                    debug!("Read: {:?}", offset);
+                    trace!("Read: {:?}", offset);
                     match self.handle_read(*offset, *size).await {
                         Ok(result) => Ok((IOUringActorResponse::Read(result), 0)),
                         Err(e) => {
@@ -386,7 +384,7 @@ mod linux_impl {
                     fsync,
                     sender,
                 } => {
-                    debug!("Write: {:?}", offset);
+                    trace!("Write: {:?}", offset);
                     match self.handle_write(*offset, &buffer, *fsync).await {
                         Ok(()) => Ok((
                             IOUringActorResponse::Write,
