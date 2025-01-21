@@ -133,7 +133,7 @@ mod linux_impl {
                 receiver,
             };
 
-            tokio::spawn(actor.run());
+            tokio::spawn(actor.run(channel_size));
 
             Ok(Self { sender })
         }
@@ -222,14 +222,14 @@ mod linux_impl {
     impl<const BLOCK_SIZE: usize> IOUringActor<BLOCK_SIZE> {
         /// run starts the actor loop, that will flip between consuming commands from the receiver,
         /// submitting them to the ring, polling completions, and sending responses back to the caller.
-        async fn run(mut self) {
+        async fn run(mut self, queue_size: usize) {
             debug!("Starting actor loop");
-            const MAX_COMMANDS: usize = 10; // TODO: Make this configurable
             let mut responders: VecDeque<(
                 IOUringActorCommand,           // Need command to keep buffer in scope
                 (IOUringActorResponse, usize), // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
-            )> = VecDeque::with_capacity(MAX_COMMANDS);
+            )> = VecDeque::with_capacity(queue_size);
             loop {
+                // TODO: ensure that we don't take if the responders queue is full
                 let command = match self.receiver.try_recv() {
                     Ok(command) => Some(command),
                     Err(e) => match e {
@@ -647,7 +647,7 @@ mod tests {
         // println!("contents: {:?}", contents);
 
         // Create a new device instance
-        let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 0).await?;
+        let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 128).await?;
 
         // Test data
         // let mut write_data = [0u8; 1033];
