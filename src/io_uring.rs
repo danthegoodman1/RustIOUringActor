@@ -226,11 +226,9 @@ mod linux_impl {
             debug!("Starting actor loop");
             const MAX_COMMANDS: usize = 10; // TODO: Make this configurable
             let mut responders: VecDeque<(
-                IOUringActorResponse,
-                usize, // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
+                IOUringActorCommand,           // Need command to keep buffer in scope
+                (IOUringActorResponse, usize), // How many following operations we must wait for, any of which can error, but only the first can provide the successful response
             )> = VecDeque::with_capacity(MAX_COMMANDS);
-            let mut pending_commands: VecDeque<IOUringActorCommand> =
-                VecDeque::with_capacity(MAX_COMMANDS); // hack to keep command in scope (and thus buffer)
             loop {
                 let command = match self.receiver.try_recv() {
                     Ok(command) => Some(command),
@@ -250,9 +248,8 @@ mod linux_impl {
                 if let Some(command) = command {
                     trace!("Submitting command");
                     if let Ok(result) = self.queue_command(&command).await {
-                        responders.push_back(result);
+                        responders.push_back((command, result));
                         self.ring.submit().expect("Failed to submit command");
-                        pending_commands.push_back(command);
                         trace!("Command submitted");
                     }
                     // We already sent the error back to the caller, so we can continue
@@ -267,8 +264,7 @@ mod linux_impl {
                         responders.len(),
                         self.ring.completion().len()
                     );
-                    let (response, wait_for_extra) = responders.pop_front().unwrap();
-                    let command = pending_commands.pop_front().unwrap();
+                    let (command, (response, wait_for_extra)) = responders.pop_front().unwrap();
                     let sender = command.sender();
                     // We finally got an entry, let's take it
                     let result = self.ring.completion().next();
