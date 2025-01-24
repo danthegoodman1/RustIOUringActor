@@ -266,7 +266,19 @@ mod linux_impl {
         }
 
         pub async fn trim_block(&self, offset: u64) -> std::io::Result<()> {
-            todo!()
+            let (sender, receiver) = flume::unbounded();
+            self.sender
+                .send_async(IOUringActorCommand::TrimBlock { offset, sender })
+                .await
+                .unwrap();
+            let response = receiver.recv_async().await.unwrap();
+            match response {
+                Ok(IOUringActorResponse::TrimBlock) => Ok(()),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Invalid response",
+                )),
+            }
         }
     }
 
@@ -458,8 +470,18 @@ mod linux_impl {
                 }
 
                 IOUringActorCommand::TrimBlock { offset, sender } => {
-                    debug!("TrimBlock: {:?}", offset);
-                    todo!()
+                    trace!("TrimBlock: {:?}", offset);
+                    match self.handle_trim(*offset).await {
+                        Ok(()) => Ok((IOUringActorResponse::TrimBlock, 0)),
+                        Err(e) => {
+                            debug!("handle_trim error: {:?}", e);
+                            let _ = sender.send_async(Err(e)).await;
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "handle_trim error",
+                            ))
+                        }
+                    }
                 }
 
                 IOUringActorCommand::ReadBlockDirect { offset, sender } => {
@@ -770,42 +792,25 @@ mod tests {
         )
         .await?;
 
-        // Test data
-        // let mut write_data = [0u8; 1033];
+        // Write test data
         let hello = b"Hello, world!\n";
-        // write_data[..hello.len()].copy_from_slice(hello);
+        api.write_block(0, hello).await?;
 
-        // Write test (without fsync)
-        api.write_block(0, hello).await.unwrap();
+        // Verify data was written
+        let result = api.read_block(0).await?;
+        assert_eq!(&result[..hello.len()], hello);
 
-        // Read test
-        println!("Reading");
-        let result = api.read_block(0).await.unwrap();
+        // Trim the block
+        api.trim_block(0).await?;
 
-        // Verify the contents
-        let buffer_slice = result.as_slice();
-        println!("Read data: {:?}", &buffer_slice[..hello.len()]);
+        // Read again - should now contain zeros
+        let result = api.read_block(0).await?;
+        println!("Read data after trim: {:?}", &result[..hello.len()]);
         println!(
-            "Read data (string): {}",
-            String::from_utf8_lossy(&buffer_slice[..hello.len()])
+            "Read data after trim (string): {:?}",
+            String::from_utf8_lossy(&result[..hello.len()])
         );
-        assert_eq!(&buffer_slice[..hello.len()], hello);
-
-        // Write test (with fsync)
-        let hello = b"Hello, world again!\n";
-        api.write_block(0, hello).await.unwrap();
-
-        // Read test
-        let result = api.read_block(0).await.unwrap();
-
-        // Verify the contents
-        let buffer_slice = result.as_slice();
-        println!("Read data: {:?}", &buffer_slice[..hello.len()]);
-        println!(
-            "Read data (string): {}",
-            String::from_utf8_lossy(&buffer_slice[..hello.len()])
-        );
-        assert_eq!(&buffer_slice[..hello.len()], hello);
+        assert_eq!(&result[..hello.len()], &vec![0u8; hello.len()]);
 
         Ok(())
     }
