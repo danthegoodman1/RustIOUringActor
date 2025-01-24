@@ -263,6 +263,7 @@ mod linux_impl {
             }
         }
 
+        /// trim_block uses direct IO to deallocate a block on the device. This reduces wear on SSDs compared to writing zeros.
         pub async fn trim_block(&self, offset: u64) -> std::io::Result<()> {
             let (sender, receiver) = flume::unbounded();
             self.sender
