@@ -216,7 +216,7 @@ mod linux_impl {
             }
         }
 
-        /// write_block uses direct IO to write a block to the device.
+        /// write_block uses direct IO to write a block to the device. The buffer must be less than or equal to BLOCK_SIZE.
         #[instrument(skip_all, level = "debug")]
         pub async fn write_block(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
             if data.len() > BLOCK_SIZE {
