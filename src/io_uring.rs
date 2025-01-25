@@ -743,7 +743,7 @@ mod tests {
 
         // Create a temporary file path
         // let temp_file = tempfile::NamedTempFile::new()?;
-        let temp_path = "blah.test";
+        let temp_path = "blah_direct.test";
         println!("temp_path: {:?}", temp_path);
 
         let file = std::fs::OpenOptions::new()
