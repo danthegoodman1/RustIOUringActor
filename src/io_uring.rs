@@ -231,12 +231,7 @@ mod linux_impl {
         /// write can optionally call fsync after the write operation, which is another io_uring operation.
         /// If either of these operations fail, the operation will return an error, even if the write operation succeeded.
         #[instrument(skip(self, offset, buffer), level = "debug")]
-        pub async fn write(
-            &self,
-            offset: u64,
-            buffer: Vec<u8>,
-            fsync: bool,
-        ) -> std::io::Result<()> {
+        pub async fn write(&self, offset: u64, buffer: Vec<u8>) -> std::io::Result<()> {
             let (sender, receiver) = flume::unbounded();
             self.sender
                 .send_async(IOUringActorCommand::Write {
@@ -312,6 +307,7 @@ mod linux_impl {
         }
 
         /// trim_block uses direct IO to deallocate a block on the device. This reduces wear on SSDs compared to writing zeros.
+        #[instrument(skip_all, level = "debug")]
         pub async fn trim_block(&self, offset: u64) -> std::io::Result<()> {
             let (sender, receiver) = flume::unbounded();
             self.sender
@@ -681,7 +677,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(libc::O_SYNC)
+            .custom_flags(libc::O_DSYNC)
             .open(temp_path)?;
 
         println!("fd: {:?}", file);
@@ -696,8 +692,8 @@ mod tests {
         let hello = b"Hello, world!\n";
         // write_data[..hello.len()].copy_from_slice(hello);
 
-        // Write test (without fsync)
-        api.write(0, hello.to_vec(), false).await.unwrap();
+        // Write test
+        api.write(0, hello.to_vec()).await.unwrap();
 
         // Read test
         println!("Reading");
@@ -712,9 +708,9 @@ mod tests {
         );
         assert_eq!(&buffer_slice[..hello.len()], hello);
 
-        // Write test (with fsync)
+        // Write again
         let hello = b"Hello, world again!\n";
-        api.write(0, hello.to_vec(), true).await.unwrap();
+        api.write(0, hello.to_vec()).await.unwrap();
 
         // Read test
         let result = api.read(0, 20).await.unwrap();
@@ -767,6 +763,16 @@ mod tests {
         // Verify data was written
         api.read_block(0, read_buffer.clone()).await?;
         assert_eq!(&read_buffer.as_slice()[..hello.len()], hello);
+
+        // Write new test data
+        let hello2 = b"Hello again, world!\n";
+        let mut hello_buffer2 = Box::new(Page4K([0u8; 4096]));
+        hello_buffer2.copy_from_slice(hello2);
+        api.write_block(0, hello_buffer2).await?;
+
+        // Verify new data was written
+        api.read_block(0, read_buffer.clone()).await?;
+        assert_eq!(&read_buffer.as_slice()[..hello2.len()], hello2);
 
         // Trim the block
         api.trim_block(0).await?;
