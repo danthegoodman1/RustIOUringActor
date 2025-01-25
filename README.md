@@ -34,5 +34,3 @@ Direct IO is performant as well (M3 Max, 128GB ram, VS Code dev container, `O_DS
 ```
 
 First write again always seems to be slower.
-
-It uses a bit more unsafe code to coerce Rust into allowing us to have shared references and obtain a mutable pointer to a buffer that should otherwise not be mutated, and adding clone for convenience.
