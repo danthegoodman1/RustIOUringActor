@@ -74,67 +74,6 @@ mod linux_impl {
     use tracing::{debug, error, info, instrument, trace};
 
     #[derive(Debug)]
-    /// SendSyncBuffer is a buffer that can be sent over channels and shared between threads.
-    /// Never attempt to mutate the buffer, it's unsafe, and the crate does this carefully for you.
-    /// Cloning is safe for when you need to read it later.
-    /// ```
-    /// // Create a 4k aligned buffer
-    /// create_aligned_page!(Page4K, 4096);
-    ///
-    /// // Create a new device instance
-    /// let api = IOUringAPI::<BLOCK_SIZE, Page4K<4096>>::new(file, ring, 128).await?;
-    ///
-    /// // Write test data
-    /// let hello = b"Hello, world!\n";
-    /// let mut hello_buffer = Box::new(Page4K([0u8; 4096]));
-    /// hello_buffer.copy_from_slice(hello); // Copy the hello data into the aligned buffer
-    /// api.write_block(0, hello_buffer).await?;
-    ///
-    /// // Prepare a buffer to read into
-    /// let read_buffer = SendSyncBuffer::new(Box::new(Page4K([0u8; 4096])));
-    ///
-    /// // Verify data was written
-    /// api.read_block(0, read_buffer.clone()).await?;
-    /// assert_eq!(&read_buffer.as_slice()[..hello.len()], hello);
-    /// ```
-    pub struct SendSyncBuffer(Arc<UnsafeCell<Box<dyn AlignedBuffer>>>);
-
-    impl SendSyncBuffer {
-        pub fn new(buffer: Box<dyn AlignedBuffer>) -> Self {
-            Self(Arc::new(UnsafeCell::new(buffer)))
-        }
-
-        /// Returns a slice of the buffer's contents
-        pub fn as_slice(&self) -> &[u8] {
-            unsafe { (*self.0.get()).as_slice() }
-        }
-
-        /// Returns a mutable slice of the buffer's contents
-        pub fn as_slice_mut(&mut self) -> &mut [u8] {
-            unsafe { (*self.0.get()).as_slice_mut() }
-        }
-
-        /// Returns a reference to the underlying AlignedBuffer
-        pub fn as_aligned_buffer(&self) -> &dyn AlignedBuffer {
-            unsafe { &**self.0.get() }
-        }
-
-        /// Returns a mutable reference to the underlying AlignedBuffer
-        pub fn as_aligned_buffer_mut(&mut self) -> &mut dyn AlignedBuffer {
-            unsafe { &mut **self.0.get() }
-        }
-    }
-
-    impl Clone for SendSyncBuffer {
-        fn clone(&self) -> Self {
-            Self(self.0.clone())
-        }
-    }
-
-    unsafe impl Send for SendSyncBuffer {}
-    unsafe impl Sync for SendSyncBuffer {}
-
-    #[derive(Debug)]
     pub enum IOUringActorCommand {
         // Non-direct
         Read {
@@ -152,7 +91,7 @@ mod linux_impl {
         ReadBlockDirect {
             offset: u64,
             sender: Sender<std::io::Result<IOUringActorResponse>>,
-            buffer: SendSyncBuffer,
+            buffer: Option<Box<dyn AlignedBuffer>>, // option because we remove it later, not awesome
         },
         WriteBlockDirect {
             offset: u64,
@@ -186,7 +125,7 @@ mod linux_impl {
         Write,
 
         // Direct
-        ReadBlockDirect,
+        ReadBlockDirect(Box<dyn AlignedBuffer>),
         WriteBlockDirect,
 
         // Other responses
@@ -348,19 +287,23 @@ mod linux_impl {
         /// assert_eq!(&read_buffer.as_slice()[..hello.len()], hello);
         /// ```
         #[instrument(skip_all, level = "debug")]
-        pub async fn read_block(&self, offset: u64, buffer: SendSyncBuffer) -> std::io::Result<()> {
+        pub async fn read_block(
+            &self,
+            offset: u64,
+            buffer: Box<dyn AlignedBuffer>,
+        ) -> std::io::Result<Box<dyn AlignedBuffer>> {
             let (sender, receiver) = flume::unbounded();
             self.sender
                 .send_async(IOUringActorCommand::ReadBlockDirect {
                     offset,
                     sender,
-                    buffer,
+                    buffer: Some(buffer),
                 })
                 .await
                 .unwrap();
             let response = receiver.recv_async().await.unwrap();
             match response {
-                Ok(IOUringActorResponse::ReadBlockDirect) => Ok(()),
+                Ok(IOUringActorResponse::ReadBlockDirect(result)) => Ok(result),
                 _ => Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "Invalid response",
@@ -423,8 +366,8 @@ mod linux_impl {
                 // If we got a command, let's submit it and add it to the responders queue
                 if let Some(command) = command {
                     trace!("Submitting command");
-                    if let Ok(result) = self.queue_command(&command).await {
-                        responders.push_back((command, result));
+                    if let Ok(result) = self.queue_command(command).await {
+                        responders.push_back(result);
                         self.ring.submit().expect("Failed to submit command");
                         trace!("Command submitted");
                     }
@@ -477,8 +420,8 @@ mod linux_impl {
 
         async fn queue_command(
             &mut self,
-            command: &IOUringActorCommand,
-        ) -> std::io::Result<IOUringActorResponse> {
+            command: IOUringActorCommand,
+        ) -> std::io::Result<(IOUringActorCommand, IOUringActorResponse)> {
             match command {
                 IOUringActorCommand::Read {
                     offset,
@@ -486,8 +429,16 @@ mod linux_impl {
                     sender,
                 } => {
                     trace!("Read: {:?}", offset);
-                    match self.handle_read(*offset, *size).await {
-                        Ok(result) => Ok(IOUringActorResponse::Read(result)),
+                    match self.handle_read(offset, size).await {
+                        Ok(result) => Ok((
+                            IOUringActorCommand::Read {
+                                // reconstruct isn't awesome, but need it for borrow checker
+                                offset,
+                                size,
+                                sender,
+                            },
+                            IOUringActorResponse::Read(result),
+                        )),
                         Err(e) => {
                             debug!("handle_read error: {:?}", e);
                             let _ = sender.send_async(Err(e)).await;
@@ -505,8 +456,15 @@ mod linux_impl {
                     sender,
                 } => {
                     trace!("Write: {:?}", offset);
-                    match self.handle_write(*offset, &buffer).await {
-                        Ok(()) => Ok(IOUringActorResponse::Write),
+                    match self.handle_write(offset, &buffer).await {
+                        Ok(()) => Ok((
+                            IOUringActorCommand::Write {
+                                offset,
+                                buffer,
+                                sender,
+                            },
+                            IOUringActorResponse::Write,
+                        )),
                         Err(e) => {
                             debug!("handle_write error: {:?}", e);
                             let _ = sender.send_async(Err(e)).await;
@@ -520,8 +478,11 @@ mod linux_impl {
 
                 IOUringActorCommand::TrimBlock { offset, sender } => {
                     trace!("TrimBlock: {:?}", offset);
-                    match self.handle_trim(*offset).await {
-                        Ok(()) => Ok(IOUringActorResponse::TrimBlock),
+                    match self.handle_trim(offset).await {
+                        Ok(()) => Ok((
+                            IOUringActorCommand::TrimBlock { offset, sender },
+                            IOUringActorResponse::TrimBlock,
+                        )),
                         Err(e) => {
                             debug!("handle_trim error: {:?}", e);
                             let _ = sender.send_async(Err(e)).await;
@@ -539,9 +500,16 @@ mod linux_impl {
                     buffer,
                 } => {
                     trace!("ReadBlockDirect: {:?}", offset);
-
-                    match self.handle_read_direct(*offset, buffer).await {
-                        Ok(()) => Ok(IOUringActorResponse::ReadBlockDirect),
+                    let buffer = buffer.unwrap();
+                    match self.handle_read_direct(offset, buffer).await {
+                        Ok(buffer) => Ok((
+                            IOUringActorCommand::ReadBlockDirect {
+                                offset,
+                                sender,
+                                buffer: None,
+                            },
+                            IOUringActorResponse::ReadBlockDirect(buffer),
+                        )),
                         Err(e) => {
                             debug!("handle_read_direct error: {:?}", e);
                             let _ = sender.send_async(Err(e)).await;
@@ -559,8 +527,15 @@ mod linux_impl {
                     sender,
                 } => {
                     trace!("WriteBlockDirect: {:?}", offset);
-                    match self.handle_write_direct(*offset, data.as_ref()).await {
-                        Ok(()) => Ok(IOUringActorResponse::WriteBlockDirect),
+                    match self.handle_write_direct(offset, data.as_ref()).await {
+                        Ok(()) => Ok((
+                            IOUringActorCommand::WriteBlockDirect {
+                                offset,
+                                data,
+                                sender,
+                            },
+                            IOUringActorResponse::WriteBlockDirect,
+                        )),
                         Err(e) => {
                             debug!("handle_write_direct error: {:?}", e);
                             let _ = sender.send_async(Err(e)).await;
@@ -595,10 +570,9 @@ mod linux_impl {
         async fn handle_read_direct(
             &mut self,
             offset: u64,
-            buffer: &SendSyncBuffer,
-        ) -> std::io::Result<()> {
-            let buf_ptr = unsafe { (*buffer.0.get()).as_mut_ptr() };
-            let read_e = opcode::Read::new(self.fd, buf_ptr, BLOCK_SIZE as _)
+            mut buffer: Box<dyn AlignedBuffer>,
+        ) -> std::io::Result<Box<dyn AlignedBuffer>> {
+            let read_e = opcode::Read::new(self.fd, buffer.as_mut_ptr(), BLOCK_SIZE as _)
                 .offset(offset)
                 .build()
                 .user_data(0x42);
@@ -610,7 +584,7 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            Ok(())
+            Ok(buffer)
         }
 
         /// Writes data, returning after submission
@@ -822,10 +796,10 @@ mod tests {
         api.write_block(0, hello_buffer).await?;
 
         // Prepare a buffer to read into
-        let read_buffer = SendSyncBuffer::new(Box::new(Page4K([0u8; 4096])));
+        let read_buffer = Box::new(Page4K([0u8; 4096]));
 
         // Verify data was written
-        api.read_block(0, read_buffer.clone()).await?;
+        let read_buffer = api.read_block(0, read_buffer).await?;
         assert_eq!(&read_buffer.as_slice()[..hello.len()], hello);
 
         // Write new test data
@@ -835,14 +809,14 @@ mod tests {
         api.write_block(0, hello_buffer2).await?;
 
         // Verify new data was written
-        api.read_block(0, read_buffer.clone()).await?;
+        let read_buffer = api.read_block(0, read_buffer).await?;
         assert_eq!(&read_buffer.as_slice()[..hello2.len()], hello2);
 
         // Trim the block
         api.trim_block(0).await?;
 
         // Read again - should now contain zeros
-        api.read_block(0, read_buffer.clone()).await?;
+        let read_buffer = api.read_block(0, read_buffer).await?;
         assert_eq!(
             &read_buffer.as_slice()[..hello.len()],
             &vec![0u8; hello.len()]
