@@ -4,26 +4,8 @@ pub trait AlignedBuffer: Send + Sync {
     fn as_ptr(&self) -> *const u8;
     fn as_mut_ptr(&mut self) -> *mut u8;
     fn len(&self) -> usize;
-
-    /// Copies data from a slice into the buffer starting at offset 0.
-    /// Returns the number of bytes copied.
-    /// Will truncate the input if it's longer than the buffer.
-    fn copy_from_slice(&mut self, data: &[u8]) -> usize {
-        let copy_len = std::cmp::min(self.len(), data.len());
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.as_mut_ptr(), copy_len);
-        }
-        copy_len
-    }
-
-    /// Returns a slice of the buffer's contents
     fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
-    }
-
-    /// Returns a mutable slice of the buffer's contents
-    fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
     }
 }
 
@@ -48,6 +30,23 @@ macro_rules! create_aligned_page {
         #[repr(align($alignment))]
         pub struct $name<const N: usize>(pub [u8; N]);
 
+        impl<const N: usize> $name<N> {
+            pub fn new_zeroed() -> Self {
+                Self([0u8; N])
+            }
+
+            pub fn new_with_data(data: &[u8]) -> Self {
+                let mut buffer = Self([0u8; N]);
+                let len = data.len().min(N);
+                buffer.0[..len].copy_from_slice(&data[..len]);
+                buffer
+            }
+
+            pub fn as_slice(&self) -> &[u8] {
+                &self.0
+            }
+        }
+
         impl<const N: usize> AlignedBuffer for $name<N> {
             fn as_ptr(&self) -> *const u8 {
                 self.0.as_ptr()
@@ -64,12 +63,11 @@ macro_rules! create_aligned_page {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use std::{cell::UnsafeCell, collections::VecDeque, marker::PhantomData, os::fd::AsRawFd};
+    use std::{collections::VecDeque, os::fd::AsRawFd};
 
     use super::AlignedBuffer;
     use flume::{Receiver, Sender, TryRecvError};
     use io_uring::{opcode, IoUring};
-    use std::sync::Arc;
     use tokio::task::yield_now;
     use tracing::{debug, error, info, instrument, trace};
 
@@ -209,23 +207,15 @@ mod linux_impl {
 
         /// write_block uses direct IO to write a block to the device. The buffer must be less than or equal to BLOCK_SIZE.
         /// ```
-        /// // Create a 4k aligned buffer
-        /// create_aligned_page!(Page4K, 4096);
-        ///
-        /// // Create a new device instance
-        /// let api = IOUringAPI::<BLOCK_SIZE, Page4K<4096>>::new(file, ring, 128).await?;
-        ///
-        /// // Write test data
         /// let hello = b"Hello, world!\n";
-        /// let mut hello_buffer = Box::new(Page4K([0u8; 4096]));
-        /// hello_buffer.copy_from_slice(hello); // Copy the hello data into the aligned buffer
-        /// api.write_block(0, hello_buffer).await?;
+        /// let write_page = Page4K::new_with_data(hello);
+        /// api.write_block(0, Box::new(write_page)).await?;
         ///
         /// // Prepare a buffer to read into
-        /// let read_buffer = SendSyncBuffer::new(Box::new(Page4K([0u8; 4096])));
+        /// let read_buffer = Box::new(Page4K([0u8; 4096]));
         ///
         /// // Verify data was written
-        /// api.read_block(0, read_buffer.clone()).await?;
+        /// let read_buffer = api.read_block(0, read_buffer).await?;
         /// assert_eq!(&read_buffer.as_slice()[..hello.len()], hello);
         /// ```
         #[instrument(skip_all, level = "debug")]
@@ -262,23 +252,15 @@ mod linux_impl {
         /// read_block uses direct IO to read a block from the device.
         /// Returns a copy of the data read, always a BLOCK_SIZE length.
         /// ```
-        /// // Create a 4k aligned buffer
-        /// create_aligned_page!(Page4K, 4096);
-        ///
-        /// // Create a new device instance
-        /// let api = IOUringAPI::<BLOCK_SIZE, Page4K<4096>>::new(file, ring, 128).await?;
-        ///
-        /// // Write test data
         /// let hello = b"Hello, world!\n";
-        /// let mut hello_buffer = Box::new(Page4K([0u8; 4096]));
-        /// hello_buffer.copy_from_slice(hello); // Copy the hello data into the aligned buffer
-        /// api.write_block(0, hello_buffer).await?;
+        /// let write_page = Page4K::new_with_data(hello);
+        /// api.write_block(0, Box::new(write_page)).await?;
         ///
         /// // Prepare a buffer to read into
-        /// let read_buffer = SendSyncBuffer::new(Box::new(Page4K([0u8; 4096])));
+        /// let read_buffer = Box::new(Page4K([0u8; 4096]));
         ///
         /// // Verify data was written
-        /// api.read_block(0, read_buffer.clone()).await?;
+        /// let read_buffer = api.read_block(0, read_buffer).await?;
         /// assert_eq!(&read_buffer.as_slice()[..hello.len()], hello);
         /// ```
         #[instrument(skip_all, level = "debug")]
@@ -656,11 +638,7 @@ mod tests {
     use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, Layer};
 
     use super::*;
-    use std::{
-        cell::UnsafeCell,
-        os::unix::fs::OpenOptionsExt,
-        sync::{Arc, Once},
-    };
+    use std::{os::unix::fs::OpenOptionsExt, sync::Once};
 
     static LOGGER_ONCE: Once = Once::new();
 
@@ -784,13 +762,13 @@ mod tests {
         let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 128).await?;
 
         // Write test data
+        // Example: Write to offset 0
         let hello = b"Hello, world!\n";
-        let mut hello_buffer = Box::new(Page4K([0u8; 4096]));
-        hello_buffer.copy_from_slice(hello); // Copy the hello data into the aligned buffer
-        api.write_block(0, hello_buffer).await?;
+        let write_page: Page4K<4096> = Page4K::new_with_data(hello);
+        api.write_block(0, Box::new(write_page)).await?;
 
         // Prepare a buffer to read into
-        let read_buffer = Box::new(Page4K([0u8; 4096]));
+        let read_buffer = Box::new(Page4K([0u8; BLOCK_SIZE]));
 
         // Verify data was written
         let read_buffer = api.read_block(0, read_buffer).await?;
@@ -798,9 +776,8 @@ mod tests {
 
         // Write new test data
         let hello2 = b"Hello again, world!\n";
-        let mut hello_buffer2 = Box::new(Page4K([0u8; 4096]));
-        hello_buffer2.copy_from_slice(hello2);
-        api.write_block(0, hello_buffer2).await?;
+        let write_page2: Page4K<4096> = Page4K::new_with_data(hello2);
+        api.write_block(0, Box::new(write_page2)).await?;
 
         // Verify new data was written
         let read_buffer = api.read_block(0, read_buffer).await?;
