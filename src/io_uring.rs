@@ -73,8 +73,30 @@ mod linux_impl {
     use tokio::task::yield_now;
     use tracing::{debug, error, info, instrument, trace};
 
-    // Add this struct above the IOUringActorCommand enum
     #[derive(Debug)]
+    /// SendSyncBuffer is a buffer that can be sent over channels and shared between threads.
+    /// Never attempt to mutate the buffer, it's unsafe, and the crate does this carefully for you.
+    /// Cloning is safe for when you need to read it later.
+    /// ```
+    /// // Create a 4k aligned buffer
+    /// create_aligned_page!(Page4K, 4096);
+    ///
+    /// // Create a new device instance
+    /// let api = IOUringAPI::<BLOCK_SIZE, Page4K<4096>>::new(file, ring, 128).await?;
+    ///
+    /// // Write test data
+    /// let hello = b"Hello, world!\n";
+    /// let mut hello_buffer = Box::new(Page4K([0u8; 4096]));
+    /// hello_buffer.copy_from_slice(hello); // Copy the hello data into the aligned buffer
+    /// api.write_block(0, hello_buffer).await?;
+    ///
+    /// // Prepare a buffer to read into
+    /// let read_buffer = SendSyncBuffer::new(Box::new(Page4K([0u8; 4096])));
+    ///
+    /// // Verify data was written
+    /// api.read_block(0, read_buffer.clone()).await?;
+    /// assert_eq!(&read_buffer.as_slice()[..hello.len()], hello);
+    /// ```
     pub struct SendSyncBuffer(Arc<UnsafeCell<Box<dyn AlignedBuffer>>>);
 
     impl SendSyncBuffer {
@@ -252,6 +274,26 @@ mod linux_impl {
         }
 
         /// write_block uses direct IO to write a block to the device. The buffer must be less than or equal to BLOCK_SIZE.
+        /// ```
+        /// // Create a 4k aligned buffer
+        /// create_aligned_page!(Page4K, 4096);
+        ///
+        /// // Create a new device instance
+        /// let api = IOUringAPI::<BLOCK_SIZE, Page4K<4096>>::new(file, ring, 128).await?;
+        ///
+        /// // Write test data
+        /// let hello = b"Hello, world!\n";
+        /// let mut hello_buffer = Box::new(Page4K([0u8; 4096]));
+        /// hello_buffer.copy_from_slice(hello); // Copy the hello data into the aligned buffer
+        /// api.write_block(0, hello_buffer).await?;
+        ///
+        /// // Prepare a buffer to read into
+        /// let read_buffer = SendSyncBuffer::new(Box::new(Page4K([0u8; 4096])));
+        ///
+        /// // Verify data was written
+        /// api.read_block(0, read_buffer.clone()).await?;
+        /// assert_eq!(&read_buffer.as_slice()[..hello.len()], hello);
+        /// ```
         #[instrument(skip_all, level = "debug")]
         pub async fn write_block(
             &self,
@@ -285,6 +327,26 @@ mod linux_impl {
 
         /// read_block uses direct IO to read a block from the device.
         /// Returns a copy of the data read, always a BLOCK_SIZE length.
+        /// ```
+        /// // Create a 4k aligned buffer
+        /// create_aligned_page!(Page4K, 4096);
+        ///
+        /// // Create a new device instance
+        /// let api = IOUringAPI::<BLOCK_SIZE, Page4K<4096>>::new(file, ring, 128).await?;
+        ///
+        /// // Write test data
+        /// let hello = b"Hello, world!\n";
+        /// let mut hello_buffer = Box::new(Page4K([0u8; 4096]));
+        /// hello_buffer.copy_from_slice(hello); // Copy the hello data into the aligned buffer
+        /// api.write_block(0, hello_buffer).await?;
+        ///
+        /// // Prepare a buffer to read into
+        /// let read_buffer = SendSyncBuffer::new(Box::new(Page4K([0u8; 4096])));
+        ///
+        /// // Verify data was written
+        /// api.read_block(0, read_buffer.clone()).await?;
+        /// assert_eq!(&read_buffer.as_slice()[..hello.len()], hello);
+        /// ```
         #[instrument(skip_all, level = "debug")]
         pub async fn read_block(&self, offset: u64, buffer: SendSyncBuffer) -> std::io::Result<()> {
             let (sender, receiver) = flume::unbounded();
@@ -747,7 +809,8 @@ mod tests {
 
         println!("fd: {:?}", file);
 
-        create_aligned_page!(Page4K, 4096); // test creating an aliged page with a macro
+        // Create a 4k aligned buffer
+        create_aligned_page!(Page4K, 4096);
 
         // Create a new device instance
         let api = IOUringAPI::<BLOCK_SIZE, Page4K<4096>>::new(file, ring, 128).await?;
@@ -758,6 +821,7 @@ mod tests {
         hello_buffer.copy_from_slice(hello); // Copy the hello data into the aligned buffer
         api.write_block(0, hello_buffer).await?;
 
+        // Prepare a buffer to read into
         let read_buffer = SendSyncBuffer::new(Box::new(Page4K([0u8; 4096])));
 
         // Verify data was written
