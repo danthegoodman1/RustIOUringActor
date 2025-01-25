@@ -23,14 +23,14 @@ First write always seems to be slower.
 Direct IO is performant as well (M3 Max, 128GB ram, VS Code dev container, `O_DSYNC`):
 
 ```
-2025-01-25T18:52:46.313058Z DEBUG write_block: src/io_uring.rs:255: close time.busy=2.21µs time.idle=699µs
-2025-01-25T18:52:46.313153Z DEBUG read_block: src/io_uring.rs:288: close time.busy=875ns time.idle=83.0µs
+2025-01-25T18:59:44.143084Z DEBUG write_block: src/io_uring.rs:255: close time.busy=8.75µs time.idle=211µs
+2025-01-25T18:59:44.143189Z DEBUG read_block: src/io_uring.rs:288: close time.busy=6.00µs time.idle=71.6µs
 
-2025-01-25T18:52:46.313323Z DEBUG write_block: src/io_uring.rs:255: close time.busy=751ns time.idle=161µs
-2025-01-25T18:52:46.313398Z DEBUG read_block: src/io_uring.rs:288: close time.busy=750ns time.idle=66.7µs
+2025-01-25T18:59:44.143337Z DEBUG write_block: src/io_uring.rs:255: close time.busy=5.67µs time.idle=121µs
+2025-01-25T18:59:44.143412Z DEBUG read_block: src/io_uring.rs:288: close time.busy=4.88µs time.idle=53.9µs
 
-2025-01-25T18:52:46.313505Z DEBUG trim_block: src/io_uring.rs:310: close time.busy=791ns time.idle=101µs
-2025-01-25T18:52:46.313656Z DEBUG read_block: src/io_uring.rs:288: close time.busy=708ns time.idle=144µs
+2025-01-25T18:59:44.143518Z DEBUG trim_block: src/io_uring.rs:310: close time.busy=4.88µs time.idle=85.2µs
+2025-01-25T18:59:44.143649Z DEBUG read_block: src/io_uring.rs:288: close time.busy=15.7µs time.idle=101µs
 ```
 
 First write again always seems to be slower.
