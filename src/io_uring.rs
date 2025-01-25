@@ -132,12 +132,11 @@ mod linux_impl {
         TrimBlock,
     }
 
-    pub struct IOUringAPI<const BLOCK_SIZE: usize, T: AlignedBuffer> {
+    pub struct IOUringAPI<const BLOCK_SIZE: usize> {
         sender: Sender<IOUringActorCommand>,
-        _phantom: PhantomData<T>,
     }
 
-    impl<const BLOCK_SIZE: usize, T: AlignedBuffer + 'static> IOUringAPI<BLOCK_SIZE, T> {
+    impl<const BLOCK_SIZE: usize> IOUringAPI<BLOCK_SIZE> {
         pub async fn new(
             fd: std::fs::File,
             ring: IoUring,
@@ -150,20 +149,16 @@ mod linux_impl {
 
             let uring_fd = io_uring::types::Fd(fd.as_raw_fd());
 
-            let actor = IOUringActor::<BLOCK_SIZE, T> {
+            let actor = IOUringActor::<BLOCK_SIZE> {
                 _fd: fd,
                 fd: uring_fd,
                 ring,
                 receiver,
-                _phantom: PhantomData,
             };
 
             tokio::spawn(actor.run(channel_size));
 
-            Ok(Self {
-                sender,
-                _phantom: PhantomData,
-            })
+            Ok(Self { sender })
         }
 
         /// Read uses non-direct IO to read a block from the device.
@@ -330,15 +325,14 @@ mod linux_impl {
         }
     }
 
-    pub struct IOUringActor<const BLOCK_SIZE: usize, T: AlignedBuffer> {
+    pub struct IOUringActor<const BLOCK_SIZE: usize> {
         _fd: std::fs::File, // Keeps the file descriptor alive
         fd: io_uring::types::Fd,
         ring: IoUring,
         receiver: Receiver<IOUringActorCommand>,
-        _phantom: PhantomData<T>,
     }
 
-    impl<const BLOCK_SIZE: usize, T: AlignedBuffer> IOUringActor<BLOCK_SIZE, T> {
+    impl<const BLOCK_SIZE: usize> IOUringActor<BLOCK_SIZE> {
         /// run starts the actor loop, that will flip between consuming commands from the receiver,
         /// submitting them to the ring, polling completions, and sending responses back to the caller.
         async fn run(mut self, queue_size: usize) {
@@ -721,7 +715,7 @@ mod tests {
         create_aligned_page!(Page4K, 4096); // test creating an aliged page with a macro
 
         // Create a new device instance
-        let api = IOUringAPI::<BLOCK_SIZE, Page4K<4096>>::new(file, ring, 128).await?;
+        let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 128).await?;
 
         // Test data
         // let mut write_data = [0u8; 1033];
@@ -787,7 +781,7 @@ mod tests {
         create_aligned_page!(Page4K, 4096);
 
         // Create a new device instance
-        let api = IOUringAPI::<BLOCK_SIZE, Page4K<4096>>::new(file, ring, 128).await?;
+        let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 128).await?;
 
         // Write test data
         let hello = b"Hello, world!\n";
