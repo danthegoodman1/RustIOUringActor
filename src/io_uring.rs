@@ -199,7 +199,6 @@ mod linux_impl {
         }
     }
 
-    #[derive(Debug)]
     pub enum IOUringActorResponse {
         // Non-direct
         Read(Vec<u8>),
@@ -213,7 +212,7 @@ mod linux_impl {
         TrimBlock,
 
         // Add new Metadata response
-        Metadata(statx),
+        Metadata(libc::statx),
     }
 
     pub struct IOUringAPI<const BLOCK_SIZE: usize> {
@@ -394,7 +393,7 @@ mod linux_impl {
 
         /// get_metadata retrieves file metadata using statx
         #[instrument(skip_all, level = "debug")]
-        pub async fn get_metadata(&self) -> std::io::Result<statx> {
+        pub async fn get_metadata(&self) -> std::io::Result<libc::statx> {
             let (sender, receiver) = flume::unbounded();
             self.sender
                 .send_async(IOUringActorCommand::GetMetadata { sender })
@@ -632,7 +631,7 @@ mod linux_impl {
                     match self.handle_metadata().await {
                         Ok(metadata) => Ok((
                             IOUringActorCommand::GetMetadata { sender },
-                            IOUringActorResponse::Metadata(metadata.into()),
+                            IOUringActorResponse::Metadata(metadata),
                         )),
                         Err(e) => {
                             debug!("handle_metadata error: {:?}", e);
@@ -752,6 +751,11 @@ mod linux_impl {
             // Create uninitialized statx buffer
             let mut statx_buf: libc::statx = unsafe { std::mem::zeroed() };
 
+            println!(
+                "statx_buf: {:?}",
+                &mut statx_buf as *mut libc::statx as *mut _
+            );
+
             let statx_e = opcode::Statx::new(
                 self.fd,
                 b"\0".as_ptr().cast(),
@@ -863,7 +867,6 @@ mod tests {
 
         // Verify metadata
         let metadata = api.get_metadata().await.unwrap();
-        println!("Metadata: {:?}", metadata);
         println!("File size: {:?}", metadata.stx_size);
         assert_eq!(metadata.stx_size, hello.len() as u64);
 
