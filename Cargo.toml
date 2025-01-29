@@ -1,6 +1,6 @@
 [package]
 name = "io_uring_actor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license-file = "LICENSE"
 description = "Near-zero overhead pipelined io_uring api via actor model so you don't have to use Arc<Mutex<IOUring>>"

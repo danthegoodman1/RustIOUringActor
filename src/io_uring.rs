@@ -103,6 +103,11 @@ mod linux_impl {
             offset: u64,
             sender: Sender<std::io::Result<IOUringActorResponse>>,
         },
+
+        // Add new Metadata command
+        Statx {
+            sender: Sender<std::io::Result<IOUringActorResponse>>,
+        },
     }
 
     impl IOUringActorCommand {
@@ -113,11 +118,87 @@ mod linux_impl {
                 IOUringActorCommand::ReadBlockDirect { sender, .. } => sender,
                 IOUringActorCommand::WriteBlockDirect { sender, .. } => sender,
                 IOUringActorCommand::TrimBlock { sender, .. } => sender,
+                IOUringActorCommand::Statx { sender, .. } => sender,
             }
         }
     }
 
     #[derive(Debug)]
+    pub struct statx {
+        pub stx_mask: u32,
+        pub stx_blksize: u32,
+        pub stx_attributes: u64,
+        pub stx_nlink: u32,
+        pub stx_uid: u32,
+        pub stx_gid: u32,
+        pub stx_mode: u16,
+        __statx_pad1: [u16; 1],
+        pub stx_ino: u64,
+        pub stx_size: u64,
+        pub stx_blocks: u64,
+        pub stx_attributes_mask: u64,
+        pub stx_atime: statx_timestamp,
+        pub stx_btime: statx_timestamp,
+        pub stx_ctime: statx_timestamp,
+        pub stx_mtime: statx_timestamp,
+        pub stx_rdev_major: u32,
+        pub stx_rdev_minor: u32,
+        pub stx_dev_major: u32,
+        pub stx_dev_minor: u32,
+        pub stx_mnt_id: u64,
+        pub stx_dio_mem_align: u32,
+        pub stx_dio_offset_align: u32,
+        __statx_pad3: [u64; 12],
+    }
+
+    #[derive(Debug)]
+    pub struct statx_timestamp {
+        pub tv_sec: i64,
+        pub tv_nsec: u32,
+        __statx_timestamp_pad1: [i32; 1],
+    }
+
+    impl From<libc::statx> for statx {
+        fn from(src: libc::statx) -> Self {
+            Self {
+                stx_mask: src.stx_mask,
+                stx_blksize: src.stx_blksize,
+                stx_attributes: src.stx_attributes,
+                stx_nlink: src.stx_nlink,
+                stx_uid: src.stx_uid,
+                stx_gid: src.stx_gid,
+                stx_mode: src.stx_mode,
+                __statx_pad1: [0],
+                stx_ino: src.stx_ino,
+                stx_size: src.stx_size,
+                stx_blocks: src.stx_blocks,
+                stx_attributes_mask: src.stx_attributes_mask,
+                stx_atime: statx_timestamp::from(src.stx_atime),
+                stx_btime: statx_timestamp::from(src.stx_btime),
+                stx_ctime: statx_timestamp::from(src.stx_ctime),
+                stx_mtime: statx_timestamp::from(src.stx_mtime),
+                stx_rdev_major: src.stx_rdev_major,
+                stx_rdev_minor: src.stx_rdev_minor,
+                stx_dev_major: src.stx_dev_major,
+                stx_dev_minor: src.stx_dev_minor,
+                stx_mnt_id: src.stx_mnt_id,
+                stx_dio_mem_align: src.stx_dio_mem_align,
+                stx_dio_offset_align: src.stx_dio_offset_align,
+                __statx_pad3: [0; 12],
+            }
+        }
+    }
+
+    impl From<libc::statx_timestamp> for statx_timestamp {
+        fn from(src: libc::statx_timestamp) -> Self {
+            Self {
+                tv_sec: src.tv_sec,
+                tv_nsec: src.tv_nsec,
+                __statx_timestamp_pad1: [0],
+            }
+        }
+    }
+
     pub enum IOUringActorResponse {
         // Non-direct
         Read(Vec<u8>),
@@ -129,6 +210,9 @@ mod linux_impl {
 
         // Other responses
         TrimBlock,
+
+        // Add new Metadata response
+        Statx(Box<libc::statx>),
     }
 
     pub struct IOUringAPI<const BLOCK_SIZE: usize> {
@@ -300,6 +384,24 @@ mod linux_impl {
             let response = receiver.recv_async().await.unwrap();
             match response {
                 Ok(IOUringActorResponse::TrimBlock) => Ok(()),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Invalid response",
+                )),
+            }
+        }
+
+        /// get_metadata retrieves file metadata using statx
+        #[instrument(skip_all, level = "debug")]
+        pub async fn get_metadata(&self) -> std::io::Result<libc::statx> {
+            let (sender, receiver) = flume::unbounded();
+            self.sender
+                .send_async(IOUringActorCommand::Statx { sender })
+                .await
+                .unwrap();
+            let response = receiver.recv_async().await.unwrap();
+            match response {
+                Ok(IOUringActorResponse::Statx(metadata)) => Ok(*metadata),
                 _ => Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "Invalid response",
@@ -523,6 +625,25 @@ mod linux_impl {
                         }
                     }
                 }
+
+                IOUringActorCommand::Statx { sender } => {
+                    trace!("GetMetadata");
+                    let result = self.handle_statx().await;
+                    match result {
+                        Ok(statx_buf) => Ok((
+                            IOUringActorCommand::Statx { sender },
+                            IOUringActorResponse::Statx(statx_buf),
+                        )),
+                        Err(e) => {
+                            debug!("handle_metadata error: {:?}", e);
+                            let _ = sender.send_async(Err(e)).await;
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "handle_metadata error",
+                            ))
+                        }
+                    }
+                }
             }
         }
 
@@ -625,6 +746,28 @@ mod linux_impl {
 
             Ok(())
         }
+
+        /// Gets file metadata using statx
+        async fn handle_statx(&mut self) -> std::io::Result<Box<libc::statx>> {
+            let statx_buf = Box::new(unsafe { std::mem::zeroed::<libc::statx>() });
+            let raw_ptr = Box::into_raw(statx_buf);
+            println!("statx_buf pointer 1: {:#x}", raw_ptr as usize);
+
+            let statx_e = opcode::Statx::new(self.fd, b"\0".as_ptr().cast(), raw_ptr as *mut _)
+                .flags(libc::AT_EMPTY_PATH)
+                .mask(libc::STATX_ALL)
+                .build()
+                .user_data(0x45);
+
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&statx_e)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+
+            Ok(unsafe { Box::from_raw(raw_ptr) })
+        }
     }
 }
 
@@ -691,15 +834,11 @@ mod tests {
 
         println!("fd: {:?}", file);
 
-        create_aligned_page!(Page4K, 4096); // test creating an aliged page with a macro
-
         // Create a new device instance
         let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 128).await?;
 
         // Test data
-        // let mut write_data = [0u8; 1033];
         let hello = b"Hello, world!\n";
-        // write_data[..hello.len()].copy_from_slice(hello);
 
         // Write test
         api.write(0, hello.to_vec()).await.unwrap();
@@ -716,6 +855,13 @@ mod tests {
             String::from_utf8_lossy(&buffer_slice[..hello.len()])
         );
         assert_eq!(&buffer_slice[..hello.len()], hello);
+
+        // Verify metadata
+        let metadata = api.get_metadata().await.unwrap();
+        let std_metadata = std::fs::metadata(temp_path)?;
+        println!("io_uring size: {:?}", metadata.stx_size);
+        println!("std::fs size: {:?}", std_metadata.len());
+        assert_eq!(metadata.stx_size, std_metadata.len());
 
         // Write again
         let hello = b"Hello, world again!\n";
@@ -779,6 +925,13 @@ mod tests {
         let hello2 = b"Hello again, world!\n";
         let write_page2: Page4K<4096> = Page4K::new_with_data(hello2);
         api.write_block(0, Box::new(write_page2)).await?;
+
+        // Verify metadata
+        let metadata = api.get_metadata().await.unwrap();
+        let std_metadata = std::fs::metadata(temp_path)?;
+        println!("io_uring size: {:?}", metadata.stx_size);
+        println!("std::fs size: {:?}", std_metadata.len());
+        assert_eq!(metadata.stx_size, std_metadata.len());
 
         // Verify new data was written
         let read_buffer = api.read_block(0, read_buffer).await?;
