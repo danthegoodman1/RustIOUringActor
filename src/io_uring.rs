@@ -9,6 +9,7 @@ pub trait AlignedBuffer: Send + Sync {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl std::fmt::Debug for dyn AlignedBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "AlignedBuffer")
