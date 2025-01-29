@@ -2,6 +2,10 @@
 name = "io_uring_actor"
 version = "0.1.0"
 edition = "2021"
+license-file = "LICENSE"
+description = "Near-zero overhead pipelined io_uring api via actor model so you don't have to use Arc<Mutex<IOUring>>"
+repository = "https://github.com/danthegoodman1/RustIOUringActor"
+readme = "README.md"
 
 [dependencies]
 flume = "0.11.1"
