@@ -3,19 +3,6 @@
 version = 4
 
 [[package]]
-name = "RustIOUringActor"
-version = "0.1.0"
-dependencies = [
- "flume",
- "io-uring",
- "libc",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "addr2line"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -143,6 +130,19 @@ dependencies = [
  "bitflags",
  "cfg-if",
  "libc",
+]
+
+[[package]]
+name = "io_uring_actor"
+version = "0.1.0"
+dependencies = [
+ "flume",
+ "io-uring",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
