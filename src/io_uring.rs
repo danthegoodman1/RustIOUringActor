@@ -105,7 +105,7 @@ mod linux_impl {
         },
 
         // Add new Metadata command
-        GetMetadata {
+        Statx {
             sender: Sender<std::io::Result<IOUringActorResponse>>,
         },
     }
@@ -118,7 +118,7 @@ mod linux_impl {
                 IOUringActorCommand::ReadBlockDirect { sender, .. } => sender,
                 IOUringActorCommand::WriteBlockDirect { sender, .. } => sender,
                 IOUringActorCommand::TrimBlock { sender, .. } => sender,
-                IOUringActorCommand::GetMetadata { sender, .. } => sender,
+                IOUringActorCommand::Statx { sender, .. } => sender,
             }
         }
     }
@@ -212,7 +212,7 @@ mod linux_impl {
         TrimBlock,
 
         // Add new Metadata response
-        Metadata(libc::statx),
+        Statx(libc::statx),
     }
 
     pub struct IOUringAPI<const BLOCK_SIZE: usize> {
@@ -396,12 +396,12 @@ mod linux_impl {
         pub async fn get_metadata(&self) -> std::io::Result<libc::statx> {
             let (sender, receiver) = flume::unbounded();
             self.sender
-                .send_async(IOUringActorCommand::GetMetadata { sender })
+                .send_async(IOUringActorCommand::Statx { sender })
                 .await
                 .unwrap();
             let response = receiver.recv_async().await.unwrap();
             match response {
-                Ok(IOUringActorResponse::Metadata(metadata)) => Ok(metadata),
+                Ok(IOUringActorResponse::Statx(metadata)) => Ok(metadata),
                 _ => Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "Invalid response",
@@ -626,12 +626,12 @@ mod linux_impl {
                     }
                 }
 
-                IOUringActorCommand::GetMetadata { sender } => {
+                IOUringActorCommand::Statx { sender } => {
                     trace!("GetMetadata");
                     match self.handle_metadata().await {
                         Ok(metadata) => Ok((
-                            IOUringActorCommand::GetMetadata { sender },
-                            IOUringActorResponse::Metadata(metadata),
+                            IOUringActorCommand::Statx { sender },
+                            IOUringActorResponse::Statx(metadata),
                         )),
                         Err(e) => {
                             debug!("handle_metadata error: {:?}", e);
