@@ -837,8 +837,6 @@ mod tests {
 
         println!("fd: {:?}", file);
 
-        create_aligned_page!(Page4K, 4096); // test creating an aliged page with a macro
-
         // Create a new device instance
         let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 128).await?;
 
@@ -867,6 +865,7 @@ mod tests {
         let metadata = api.get_metadata().await.unwrap();
         println!("Metadata: {:?}", metadata);
         println!("File size: {:?}", metadata.stx_size);
+        assert_eq!(metadata.stx_size, hello.len() as u64);
 
         // Write again
         let hello = b"Hello, world again!\n";
