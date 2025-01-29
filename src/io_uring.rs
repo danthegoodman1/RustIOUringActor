@@ -212,7 +212,7 @@ mod linux_impl {
         TrimBlock,
 
         // Add new Metadata response
-        Statx(libc::statx),
+        Statx(Box<libc::statx>),
     }
 
     pub struct IOUringAPI<const BLOCK_SIZE: usize> {
@@ -401,7 +401,7 @@ mod linux_impl {
                 .unwrap();
             let response = receiver.recv_async().await.unwrap();
             match response {
-                Ok(IOUringActorResponse::Statx(metadata)) => Ok(metadata),
+                Ok(IOUringActorResponse::Statx(metadata)) => Ok(*metadata),
                 _ => Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "Invalid response",
@@ -628,10 +628,11 @@ mod linux_impl {
 
                 IOUringActorCommand::Statx { sender } => {
                     trace!("GetMetadata");
-                    match self.handle_metadata().await {
-                        Ok(metadata) => Ok((
+                    let result = self.handle_statx().await;
+                    match result {
+                        Ok(statx_buf) => Ok((
                             IOUringActorCommand::Statx { sender },
-                            IOUringActorResponse::Statx(metadata),
+                            IOUringActorResponse::Statx(statx_buf),
                         )),
                         Err(e) => {
                             debug!("handle_metadata error: {:?}", e);
@@ -747,24 +748,16 @@ mod linux_impl {
         }
 
         /// Gets file metadata using statx
-        async fn handle_metadata(&mut self) -> std::io::Result<libc::statx> {
-            // Create uninitialized statx buffer
-            let mut statx_buf: libc::statx = unsafe { std::mem::zeroed() };
+        async fn handle_statx(&mut self) -> std::io::Result<Box<libc::statx>> {
+            let statx_buf = Box::new(unsafe { std::mem::zeroed::<libc::statx>() });
+            let raw_ptr = Box::into_raw(statx_buf);
+            println!("statx_buf pointer 1: {:#x}", raw_ptr as usize);
 
-            println!(
-                "statx_buf: {:?}",
-                &mut statx_buf as *mut libc::statx as *mut _
-            );
-
-            let statx_e = opcode::Statx::new(
-                self.fd,
-                b"\0".as_ptr().cast(),
-                &mut statx_buf as *mut libc::statx as *mut _,
-            )
-            .flags(libc::AT_EMPTY_PATH)
-            .mask(libc::STATX_ALL)
-            .build()
-            .user_data(0x45);
+            let statx_e = opcode::Statx::new(self.fd, b"\0".as_ptr().cast(), raw_ptr as *mut _)
+                .flags(libc::AT_EMPTY_PATH)
+                .mask(libc::STATX_ALL)
+                .build()
+                .user_data(0x45);
 
             unsafe {
                 self.ring
@@ -773,7 +766,7 @@ mod linux_impl {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
 
-            Ok(statx_buf)
+            Ok(unsafe { Box::from_raw(raw_ptr) })
         }
     }
 }
@@ -845,9 +838,7 @@ mod tests {
         let api = IOUringAPI::<BLOCK_SIZE>::new(file, ring, 128).await?;
 
         // Test data
-        // let mut write_data = [0u8; 1033];
         let hello = b"Hello, world!\n";
-        // write_data[..hello.len()].copy_from_slice(hello);
 
         // Write test
         api.write(0, hello.to_vec()).await.unwrap();
@@ -867,8 +858,10 @@ mod tests {
 
         // Verify metadata
         let metadata = api.get_metadata().await.unwrap();
-        println!("File size: {:?}", metadata.stx_size);
-        assert_eq!(metadata.stx_size, hello.len() as u64);
+        let std_metadata = std::fs::metadata(temp_path)?;
+        println!("io_uring size: {:?}", metadata.stx_size);
+        println!("std::fs size: {:?}", std_metadata.len());
+        assert_eq!(metadata.stx_size, std_metadata.len());
 
         // Write again
         let hello = b"Hello, world again!\n";
@@ -932,6 +925,13 @@ mod tests {
         let hello2 = b"Hello again, world!\n";
         let write_page2: Page4K<4096> = Page4K::new_with_data(hello2);
         api.write_block(0, Box::new(write_page2)).await?;
+
+        // Verify metadata
+        let metadata = api.get_metadata().await.unwrap();
+        let std_metadata = std::fs::metadata(temp_path)?;
+        println!("io_uring size: {:?}", metadata.stx_size);
+        println!("std::fs size: {:?}", std_metadata.len());
+        assert_eq!(metadata.stx_size, std_metadata.len());
 
         // Verify new data was written
         let read_buffer = api.read_block(0, read_buffer).await?;
