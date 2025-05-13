@@ -64,7 +64,7 @@ macro_rules! create_aligned_page {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use std::{collections::VecDeque, os::fd::AsRawFd};
+    use std::{collections::HashMap, os::fd::AsRawFd};
 
     use super::AlignedBuffer;
     use flume::{Receiver, Sender, TryRecvError};
@@ -422,12 +422,12 @@ mod linux_impl {
         /// submitting them to the ring, polling completions, and sending responses back to the caller.
         async fn run(mut self, queue_size: usize) {
             debug!("Starting actor loop");
-            let mut responders: VecDeque<(
-                IOUringActorCommand,  // Need command to keep buffer in scope
-                IOUringActorResponse, // Response to send back to the caller
-            )> = VecDeque::with_capacity(queue_size);
+
+            let mut next_user_data: u64 = 1;
+            let mut pending: HashMap<u64, (IOUringActorCommand, IOUringActorResponse)> =
+                std::collections::HashMap::with_capacity(queue_size);
+
             loop {
-                // TODO: ensure that we don't take if the responders queue is full
                 let command = match self.receiver.try_recv() {
                     Ok(command) => Some(command),
                     Err(e) => match e {
@@ -445,8 +445,9 @@ mod linux_impl {
                 // If we got a command, let's submit it and add it to the responders queue
                 if let Some(command) = command {
                     trace!("Submitting command");
-                    if let Ok(result) = self.queue_command(command).await {
-                        responders.push_back(result);
+                    if let Ok(result) = self.queue_command(command, next_user_data).await {
+                        pending.insert(next_user_data, result);
+                        next_user_data += 1;
                         self.ring.submit().expect("Failed to submit command");
                         trace!("Command submitted");
                     }
@@ -455,20 +456,21 @@ mod linux_impl {
                     trace!("No command to submit");
                 }
 
-                // If we have responders, let's check if the tasks are completed
-                while self.ring.completion().len() > 0 && responders.len() > 0 {
+                // If we have pending commands, let's check if the tasks are completed
+                while self.ring.completion().len() > 0 && pending.len() > 0 {
                     trace!(
                         "Checking for completion {:?} {:?}",
-                        responders.len(),
+                        pending.len(),
                         self.ring.completion().len()
                     );
-                    let (command, response) = responders.pop_front().unwrap();
-                    let sender = command.sender();
-                    // We finally got an entry, let's take it
-                    let result = self.ring.completion().next();
-                    trace!("result: {:?}", result);
-                    match result {
+
+                    let completion_item = self.ring.completion().next();
+                    trace!("completion_item: {:?}", completion_item);
+                    match completion_item {
                         Some(cqe) => {
+                            let (command, response) = pending.remove(&cqe.user_data()).unwrap();
+                            let sender = command.sender();
+
                             let result = if cqe.result() < 0 {
                                 trace!("Completion error: {:?}", cqe.result());
                                 Err(std::io::Error::from_raw_os_error(-cqe.result()))
@@ -482,14 +484,7 @@ mod linux_impl {
                             let _ = sender.send_async(result).await;
                         }
                         None => {
-                            // TODO: better log on this
                             error!("No completion queue entry found");
-                            let _ = sender
-                                .send_async(Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    "No completion queue entry found",
-                                )))
-                                .await;
                         }
                     }
                 }
@@ -500,6 +495,7 @@ mod linux_impl {
         async fn queue_command(
             &mut self,
             command: IOUringActorCommand,
+            user_data: u64,
         ) -> std::io::Result<(IOUringActorCommand, IOUringActorResponse)> {
             match command {
                 IOUringActorCommand::Read {
@@ -508,7 +504,7 @@ mod linux_impl {
                     sender,
                 } => {
                     trace!("Read: {:?}", offset);
-                    match self.handle_read(offset, size).await {
+                    match self.handle_read(offset, size, user_data).await {
                         Ok(result) => Ok((
                             IOUringActorCommand::Read {
                                 // reconstruct isn't awesome, but need it for borrow checker
@@ -535,7 +531,7 @@ mod linux_impl {
                     sender,
                 } => {
                     trace!("Write: {:?}", offset);
-                    match self.handle_write(offset, &buffer).await {
+                    match self.handle_write(offset, &buffer, user_data).await {
                         Ok(()) => Ok((
                             IOUringActorCommand::Write {
                                 offset,
@@ -557,7 +553,7 @@ mod linux_impl {
 
                 IOUringActorCommand::TrimBlock { offset, sender } => {
                     trace!("TrimBlock: {:?}", offset);
-                    match self.handle_trim(offset).await {
+                    match self.handle_trim(offset, user_data).await {
                         Ok(()) => Ok((
                             IOUringActorCommand::TrimBlock { offset, sender },
                             IOUringActorResponse::TrimBlock,
@@ -580,7 +576,7 @@ mod linux_impl {
                 } => {
                     trace!("ReadBlockDirect: {:?}", offset);
                     let buffer = buffer.unwrap();
-                    match self.handle_read_direct(offset, buffer).await {
+                    match self.handle_read_direct(offset, buffer, user_data).await {
                         Ok(buffer) => Ok((
                             IOUringActorCommand::ReadBlockDirect {
                                 offset,
@@ -606,7 +602,10 @@ mod linux_impl {
                     sender,
                 } => {
                     trace!("WriteBlockDirect: {:?}", offset);
-                    match self.handle_write_direct(offset, data.as_ref()).await {
+                    match self
+                        .handle_write_direct(offset, data.as_ref(), user_data)
+                        .await
+                    {
                         Ok(()) => Ok((
                             IOUringActorCommand::WriteBlockDirect {
                                 offset,
@@ -628,7 +627,7 @@ mod linux_impl {
 
                 IOUringActorCommand::Statx { sender } => {
                     trace!("GetMetadata");
-                    let result = self.handle_statx().await;
+                    let result = self.handle_statx(user_data).await;
                     match result {
                         Ok(statx_buf) => Ok((
                             IOUringActorCommand::Statx { sender },
@@ -647,12 +646,17 @@ mod linux_impl {
             }
         }
 
-        async fn handle_read(&mut self, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
+        async fn handle_read(
+            &mut self,
+            offset: u64,
+            size: usize,
+            user_data: u64,
+        ) -> std::io::Result<Vec<u8>> {
             let mut buffer = vec![0u8; size];
             let read_e = opcode::Read::new(self.fd, buffer.as_mut_ptr(), buffer.len() as _)
                 .offset(offset)
                 .build()
-                .user_data(0x42);
+                .user_data(user_data);
 
             unsafe {
                 self.ring
@@ -669,11 +673,12 @@ mod linux_impl {
             &mut self,
             offset: u64,
             mut buffer: Box<dyn AlignedBuffer>,
+            user_data: u64,
         ) -> std::io::Result<Box<dyn AlignedBuffer>> {
             let read_e = opcode::Read::new(self.fd, buffer.as_mut_ptr(), BLOCK_SIZE as _)
                 .offset(offset)
                 .build()
-                .user_data(0x42);
+                .user_data(user_data);
 
             unsafe {
                 self.ring
@@ -686,12 +691,17 @@ mod linux_impl {
         }
 
         /// Writes data, returning after submission
-        async fn handle_write(&mut self, offset: u64, buffer: &[u8]) -> std::io::Result<()> {
+        async fn handle_write(
+            &mut self,
+            offset: u64,
+            buffer: &[u8],
+            user_data: u64,
+        ) -> std::io::Result<()> {
             // Submit the write
             let write_e = opcode::Write::new(self.fd, buffer.as_ptr(), buffer.len() as _)
                 .offset(offset)
                 .build()
-                .user_data(0x43);
+                .user_data(user_data);
 
             unsafe {
                 self.ring
@@ -708,11 +718,12 @@ mod linux_impl {
             &mut self,
             offset: u64,
             buffer: &dyn AlignedBuffer,
+            user_data: u64,
         ) -> std::io::Result<()> {
             let write_e = opcode::Write::new(self.fd, buffer.as_ptr(), buffer.len() as _)
                 .offset(offset)
                 .build()
-                .user_data(0x43);
+                .user_data(user_data);
 
             unsafe {
                 self.ring
@@ -727,7 +738,7 @@ mod linux_impl {
         /// Deallocates the block at the given offset using `FALLOC_FL_PUNCH_HOLE`, which creates a hole in the file
         /// and releases the associated storage space. On SSDs this triggers the TRIM command for better performance
         /// and wear leveling.
-        async fn handle_trim(&mut self, offset: u64) -> std::io::Result<()> {
+        async fn handle_trim(&mut self, offset: u64, user_data: u64) -> std::io::Result<()> {
             // FALLOC_FL_PUNCH_HOLE (0x02) | FALLOC_FL_KEEP_SIZE (0x01)
             const PUNCH_HOLE: i32 = 0x02 | 0x01;
 
@@ -735,7 +746,7 @@ mod linux_impl {
                 .offset(offset)
                 .mode(PUNCH_HOLE)
                 .build()
-                .user_data(0x44);
+                .user_data(user_data);
 
             unsafe {
                 self.ring
@@ -748,7 +759,7 @@ mod linux_impl {
         }
 
         /// Gets file metadata using statx
-        async fn handle_statx(&mut self) -> std::io::Result<Box<libc::statx>> {
+        async fn handle_statx(&mut self, user_data: u64) -> std::io::Result<Box<libc::statx>> {
             let statx_buf = Box::new(unsafe { std::mem::zeroed::<libc::statx>() });
             let raw_ptr = Box::into_raw(statx_buf);
             println!("statx_buf pointer 1: {:#x}", raw_ptr as usize);
@@ -757,7 +768,7 @@ mod linux_impl {
                 .flags(libc::AT_EMPTY_PATH)
                 .mask(libc::STATX_ALL)
                 .build()
-                .user_data(0x45);
+                .user_data(user_data);
 
             unsafe {
                 self.ring
