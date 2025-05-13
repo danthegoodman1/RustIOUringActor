@@ -34,3 +34,19 @@ Direct IO is performant as well (M3 Max, 128GB ram, VS Code dev container, `O_DS
 ```
 
 First write again always seems to be slower.
+
+Probably docker, but sometimes you can get it _insanely fast_:
+
+```
+$ cargo test --package io_uring_actor --lib -- io_uring::tests::test_io_uring_direct_read_write --exact --show-output
+running 1 test
+2025-05-13T02:49:02.394358Z DEBUG src/io_uring.rs:424: Starting actor loop
+2025-05-13T02:49:02.394534Z DEBUG write_block: src/io_uring.rs:306: close time.busy=1.75µs time.idle=176µs
+2025-05-13T02:49:02.394593Z DEBUG read_block: src/io_uring.rs:351: close time.busy=793ns time.idle=48.2µs
+2025-05-13T02:49:02.394699Z DEBUG write_block: src/io_uring.rs:306: close time.busy=666ns time.idle=96.4µs
+2025-05-13T02:49:02.394751Z DEBUG get_metadata: src/io_uring.rs:395: close time.busy=708ns time.idle=45.8µs
+2025-05-13T02:49:02.394809Z DEBUG read_block: src/io_uring.rs:351: close time.busy=791ns time.idle=46.8µs
+2025-05-13T02:49:02.394884Z DEBUG trim_block: src/io_uring.rs:377: close time.busy=499ns time.idle=68.3µs
+2025-05-13T02:49:02.394939Z DEBUG read_block: src/io_uring.rs:351: close time.busy=457ns time.idle=49.9µs
+test io_uring::tests::test_io_uring_direct_read_write ... ok
+```
