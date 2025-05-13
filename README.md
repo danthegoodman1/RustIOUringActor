@@ -1,5 +1,10 @@
 # RustIOUringActor
 
+> [!CAUTION]
+> I believe this currently has a bug in ordering, such that operations could be returned out of order (and thus you get the wrong reads/write responses) due to assuming that the results will be in the same order as command submissions. Whoops.
+>
+> I'm working on rewriting this so that it does not use an actor model either.
+
 Using the `IOUringAPI` a `IOUringActor` is launched that can be used async from multiple threads via the API. This allows for easy use of io_uring from async environments. This also allows for efficient use of a shared ring.
 
 The API supports `*Direct` commands for usage with direct IO in the form of operating per-block with `AlignedBuffer` (see the `created_aligned_buffer!` macro), as well as non-direct methods. You should use the correct one based on how you set up the file descriptor.
